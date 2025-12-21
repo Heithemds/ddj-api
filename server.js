@@ -155,7 +155,7 @@ app.post("/api/player/redeem", async (req, res) => {
 
     if (p.rows[0].status !== "ACTIVE") {
       client.release();
-      return res.status(403).json({ error: "player not active" });
+      return res.status(403).json({ error: "player not active", status: p.rows[0].status });
     }
     // ====== END PLAYER STATUS CHECK ======
   try {
