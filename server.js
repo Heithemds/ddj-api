@@ -325,10 +325,14 @@ app.post("/api/player/redeem", redeemRateLimit, async (req, res) => {
 });
 
 // PLAYER: place bet (uses DOS)  ✅ utilise UNIQUEMENT getRoundInfo()
+// PLAYER: place a bet (uses DOS)
+// - unlimited bets per round (as long as balance allows)
+// - timing source of truth = getRoundInfo()
 app.post("/api/bet", async (req, res) => {
   const nowMs = Date.now();
   const round = getRoundInfo(nowMs);
-
+  
+  // bets must be open according to the SAME logic as /api/round
   if (!round.betsOpen) {
     return res.status(409).json({
       error: "bets closed",
@@ -336,82 +340,148 @@ app.post("/api/bet", async (req, res) => {
       secToClose: round.secondsToClose,
     });
   }
-
+  
   const playerId = Number(req.body?.playerId);
   const amount = Number(req.body?.amount);
-  const nums = Array.isArray(req.body?.nums) ? req.body.nums.map(Number) : [];
-  const chance = Number(req.body?.chance);
-
-  if (!Number.isFinite(playerId) || playerId <= 0) return res.status(400).json({ error: "playerId invalid" });
-  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "amount invalid" });
-
-  // validation combinaison
-  const uniqNums = [...new Set(nums)];
-  if (uniqNums.length !== 4) return res.status(400).json({ error: "nums must contain 4 distinct numbers" });
-  if (uniqNums.some((n) => !Number.isInteger(n) || n < 1 || n > 20)) return res.status(400).json({ error: "nums range 1..20" });
-  if (!Number.isInteger(chance) || chance < 1 || chance > 5) return res.status(400).json({ error: "chance range 1..5" });
-
+  
+  if (!Number.isFinite(playerId) || playerId <= 0) {
+    return res.status(400).json({ error: "playerId required" });
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "amount invalid" });
+  }
+  
+  // ---- accept either (choice) or (nums+chance) ----
+  let betType = "CHOICE";
+  let choiceKey = "";
+  let betMeta = {};
+  
+  // New format: nums + chance
+  if (Array.isArray(req.body?.nums)) {
+    const nums = req.body.nums.map(Number).filter(Number.isFinite);
+    const unique = [...new Set(nums)];
+    
+    // règle simple (tu pourras ajuster): 4 numéros uniques
+    if (unique.length !== 4) {
+      return res.status(400).json({ error: "nums must contain 4 unique numbers" });
+    }
+    
+    // optionnel: borne 1..20 (tu peux changer)
+    for (const n of unique) {
+      if (!Number.isInteger(n) || n < 1 || n > 20) {
+        return res.status(400).json({ error: "nums must be integers between 1 and 20" });
+      }
+    }
+    
+    const chance = Number(req.body?.chance);
+    if (!Number.isFinite(chance) || !Number.isInteger(chance) || chance < 0) {
+      return res.status(400).json({ error: "chance invalid" });
+    }
+    
+    unique.sort((a, b) => a - b);
+    betType = "NUMS";
+    // on stocke dans la colonne "choice" comme clé lisible (simple et efficace)
+    choiceKey = `${unique.join("-")}#${chance}`;
+    betMeta = { nums: unique, chance };
+  } else {
+    // Old format: choice
+    const choice = String(req.body?.choice || "").trim().toUpperCase();
+    if (!choice) return res.status(400).json({ error: "choice required" });
+    
+    // règle simple (tu peux élargir): A/B
+    if (!["A", "B"].includes(choice)) {
+      return res.status(400).json({ error: "choice must be A or B" });
+    }
+    choiceKey = choice;
+    betMeta = { choice };
+  }
+  
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
+    
     const p = await client.query(
-      `SELECT id, balance_dos, status FROM players WHERE id=$1 FOR UPDATE`,
+      `SELECT id, balance_dos, status
+       FROM players
+       WHERE id = $1`,
       [playerId]
     );
+    
     if (p.rowCount === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "player not found" });
     }
-    if (p.rows[0].status !== "ACTIVE") {
+    
+    const player = p.rows[0];
+    if (player.status !== "ACTIVE") {
       await client.query("ROLLBACK");
-      return res.status(403).json({ error: "player not active", status: p.rows[0].status });
+      return res.status(403).json({ error: "player inactive" });
     }
-
-    const balanceBefore = Number(p.rows[0].balance_dos);
-    const cost = Math.floor(amount);
-
-    if (balanceBefore < cost) {
+    
+    const balanceBefore = Number(player.balance_dos);
+    if (!Number.isFinite(balanceBefore) || balanceBefore < amount) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "insufficient balance", balance: balanceBefore, cost });
+      return res.status(409).json({
+        error: "insufficient funds",
+        balance: balanceBefore,
+        required: amount,
+      });
     }
-
-    // insert bet (1 combinaison = 1 ligne)
-    const b = await client.query(
-      `INSERT INTO bets (player_id, round_id, nums, chance, amount)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING id, player_id, round_id, nums, chance, amount, created_at`,
-      [playerId, round.roundId, uniqNums, chance, cost]
+    
+    // 1) insert bet
+    const betRes = await client.query(
+      `INSERT INTO bets (player_id, round_id, choice, amount, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING id, player_id, round_id, choice, amount, created_at`,
+      [playerId, round.roundId, choiceKey, amount]
     );
-
-    // debit solde
-    const balanceAfter = balanceBefore - cost;
-    await client.query(`UPDATE players SET balance_dos=$1 WHERE id=$2`, [balanceAfter, playerId]);
-
-    // ledger BET
+    
+    const betRow = betRes.rows[0];
+    
+    // 2) ledger
     await client.query(
       `INSERT INTO dos_ledger (player_id, type, amount, meta)
-       VALUES ($1,'BET',$2,$3::jsonb)`,
-      [playerId, -cost, JSON.stringify({ roundId: String(round.roundId), betId: String(b.rows[0].id), nums: uniqNums, chance })]
+       VALUES ($1, 'BET', $2, $3::jsonb)`,
+      [
+        playerId,
+        -Math.abs(amount),
+        JSON.stringify({
+          betId: String(betRow.id),
+          roundId: round.roundId,
+          betType,
+          ...betMeta,
+        }),
+      ]
     );
-
+    
+    // 3) update balance
+    const upd = await client.query(
+      `UPDATE players
+       SET balance_dos = balance_dos - $2
+       WHERE id = $1
+       RETURNING balance_dos`,
+      [playerId, amount]
+    );
+    
+    const balanceAfter = Number(upd.rows[0].balance_dos);
+    
     await client.query("COMMIT");
-
+    
     return res.json({
       ok: true,
       roundId: round.roundId,
-      bet: b.rows[0],
+      bet: betRow,
       balanceBefore,
       balanceAfter,
     });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
+    await client.query("ROLLBACK");
+    console.error("❌ /api/bet ERROR:", e);
     return res.status(500).json({ error: String(e?.message || e) });
   } finally {
     client.release();
   }
 });
-
 // ====== ADMIN ======
 app.get("/api/admin/config", requireAdmin, (req, res) => {
   res.json({ roundSeconds, closeBetsAt, anchorMs, signupBonusDos: SIGNUP_BONUS_DOS });
