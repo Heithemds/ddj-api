@@ -151,7 +151,36 @@ app.get("/api/player/:playerId/ledger", async (req, res) => {
 });
 // POST /api/player/signup
 // POST /api/player/redeem
-// GET  /api/player/:playerId/ledger
+// GET /api/player/:playerId/ledger
+app.get("/api/player/:playerId/ledger", async (req, res) => {
+  try {
+    const playerId = Number(req.params.playerId);
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+
+    if (!playerId) return res.status(400).json({ error: "playerId invalid" });
+
+    const p = await pool.query(
+      `SELECT id, username, balance_dos, status, created_at
+       FROM players
+       WHERE id = $1`,
+      [playerId]
+    );
+    if (p.rowCount === 0) return res.status(404).json({ error: "player not found" });
+
+    const led = await pool.query(
+      `SELECT id, type, amount, meta, created_at
+       FROM dos_ledger
+       WHERE player_id = $1
+       ORDER BY id DESC
+       LIMIT $2`,
+      [playerId, limit]
+    );
+
+    res.json({ ok: true, player: p.rows[0], ledger: led.rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
 // ====== ROUTES ADMIN ======
 // GET /api/admin/stats
 app.get("/api/admin/stats", requireAdmin, async (req, res) => {
