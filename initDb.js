@@ -5,6 +5,50 @@ export async function initDb() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // ===== DDJ: Bank + Rounds + Bet payout columns (MIGRATION) =====
+
+// 1) Bank: carry + admin balance
+await client.query(`
+  CREATE TABLE IF NOT EXISTS game_bank (
+    id INT PRIMARY KEY,
+    carry_dos BIGINT NOT NULL DEFAULT 0,
+    admin_balance_dos BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+`);
+await client.query(`
+  INSERT INTO game_bank (id) VALUES (1)
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+// 2) Rounds: draw + totals + audit (one row per round settled)
+await client.query(`
+  CREATE TABLE IF NOT EXISTS rounds (
+    round_id BIGINT PRIMARY KEY,
+    draw_nums INT[] NULL,
+    draw_chance INT NULL,
+    total_bets_dos BIGINT NOT NULL DEFAULT 0,
+    pot_total_dos BIGINT NOT NULL DEFAULT 0,
+    admin_take_dos BIGINT NOT NULL DEFAULT 0,
+    carry_in_dos BIGINT NOT NULL DEFAULT 0,
+    carry_out_dos BIGINT NOT NULL DEFAULT 0,
+    settled_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+`);
+
+// 3) Bets: store combination + payout info (compatible with old A/B bets too)
+await client.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS nums INT[];`);
+await client.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS chance INT;`);
+await client.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS category TEXT;`);
+await client.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS payout_dos BIGINT NOT NULL DEFAULT 0;`);
+await client.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS settled BOOLEAN NOT NULL DEFAULT FALSE;`);
+
+await client.query(`CREATE INDEX IF NOT EXISTS idx_bets_round ON bets(round_id);`);
+await client.query(`CREATE INDEX IF NOT EXISTS idx_bets_player ON bets(player_id);`);
+await client.query(`CREATE INDEX IF NOT EXISTS idx_rounds_settled ON rounds(settled_at);`);
+
+// ===== END MIGRATION =====
 
     // players
     await client.query(`
