@@ -1,14 +1,11 @@
+// tickets.js
 import crypto from "crypto";
-
-// Alphabet sans O/0 et I/1 (anti confusion)
-const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sans O/0 et I/1
 
 export function generateTicketCode(length = 12) {
   let out = "";
   const bytes = crypto.randomBytes(length);
-  for (let i = 0; i < length; i++) {
-    out += ALPHABET[bytes[i] % ALPHABET.length];
-  }
+  for (let i = 0; i < length; i++) out += ALPHABET[bytes[i] % ALPHABET.length];
   return out;
 }
 
