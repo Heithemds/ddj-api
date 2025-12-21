@@ -16,18 +16,22 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const SIGNUP_BONUS_DOS = parseInt(process.env.SIGNUP_BONUS_DOS || "50", 10);
 
-// Timing
-let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10);
-let closeBetsAt  = parseInt(process.env.CLOSE_BETS_AT || "30", 10);
-let anchorMs     = parseInt(process.env.ANCHOR_MS || String(Date.now()), 10);
+// ====== TIMING (single source of truth) ======
+let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10); // durée d'un round
+let closeBetsAt  = parseInt(process.env.CLOSE_BETS_AT || "30", 10);  // fermeture X sec AVANT fin
+let anchorMs     = parseInt(process.env.ANCHOR_MS || String(Date.UTC(2025, 0, 1, 0, 0, 0)), 10);
 
-// ----- Timing guardrails (anti-bug) -----
+// Guardrails (anti-bug)
 if (!Number.isFinite(roundSeconds) || roundSeconds < 30) roundSeconds = 300;
 if (!Number.isFinite(closeBetsAt) || closeBetsAt < 1) closeBetsAt = 30;
 if (closeBetsAt >= roundSeconds) closeBetsAt = Math.max(1, roundSeconds - 1);
 if (!Number.isFinite(anchorMs)) anchorMs = Date.now();
 
-// ----- Round engine (single source of truth) -----
+/**
+ * Calcule l’état du round à un instant donné.
+ * - roundSeconds = durée du round
+ * - closeBetsAt  = fermeture des mises X secondes AVANT la fin
+ */
 function getRoundInfo(nowMs = Date.now()) {
   const roundMs = roundSeconds * 1000;
 
@@ -35,14 +39,22 @@ function getRoundInfo(nowMs = Date.now()) {
   const roundStartMs = anchorMs + roundId * roundMs;
   const roundEndMs = roundStartMs + roundMs;
 
-  // fermeture des mises = X secondes AVANT la fin
+  // ✅ fermeture des mises = X secondes avant la fin
   const closeAtMs = roundEndMs - (closeBetsAt * 1000);
 
   const betsOpen = nowMs < closeAtMs;
   const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
   const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
 
-  return { roundId, roundStartMs, roundEndMs, closeAtMs, betsOpen, secondsLeft, secondsToClose };
+  return {
+    roundId,
+    roundStartMs,
+    roundEndMs,
+    closeAtMs,
+    betsOpen,
+    secondsLeft,
+    secondsToClose
+  };
 }
 // Init DB au démarrage
 initDb().catch((e) => {
