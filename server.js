@@ -228,6 +228,111 @@ app.get("/api/player/:playerId/ledger", async (req, res) => {
 });
 // POST /api/player/signup
 // POST /api/player/redeem
+// PLAYER: place a bet (uses DOS)
+app.post("/api/bet", async (req, res) => {
+  const playerId = Number(req.body?.playerId);
+  const amount = Number(req.body?.amount);
+  const choice = String(req.body?.choice || "").trim().toUpperCase();
+
+  if (!playerId) return res.status(400).json({ error: "playerId required" });
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "amount invalid" });
+  if (!choice) return res.status(400).json({ error: "choice required" });
+
+  // Round calc (same principle as /api/round)
+  const nowMs = Date.now();
+  const roundMs = roundSeconds * 1000;
+  const roundId = Math.floor((nowMs - anchorMs) / roundMs);
+  const roundStartMs = anchorMs + roundId * roundMs;
+  const closeAtMs = roundStartMs + closeBetsAt * 1000;
+  const betsOpen = nowMs < closeAtMs;
+
+  if (!betsOpen) {
+    return res.status(409).json({
+      error: "bets closed",
+      roundId,
+      secToClose: 0
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // lock player row
+    const p = await client.query(
+      `SELECT id, username, balance_dos, status
+       FROM players
+       WHERE id=$1
+       FOR UPDATE`,
+      [playerId]
+    );
+
+    if (p.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "player not found" });
+    }
+
+    const player = p.rows[0];
+
+    if (player.status !== "ACTIVE") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "player not active", status: player.status });
+    }
+
+    const balance = Number(player.balance_dos);
+    if (balance < amount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "insufficient balance", balance });
+    }
+
+    // one bet per round per player (clean)
+    const existing = await client.query(
+      `SELECT id FROM bets WHERE player_id=$1 AND round_id=$2 LIMIT 1`,
+      [playerId, roundId]
+    );
+    if (existing.rowCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "already bet this round", roundId });
+    }
+
+    // insert bet
+    const b = await client.query(
+      `INSERT INTO bets (player_id, round_id, choice, amount)
+       VALUES ($1,$2,$3,$4)
+       RETURNING id, player_id, round_id, choice, amount, created_at`,
+      [playerId, roundId, choice, amount]
+    );
+
+    // update balance
+    const newBalance = balance - amount;
+    await client.query(
+      `UPDATE players SET balance_dos=$1 WHERE id=$2`,
+      [newBalance, playerId]
+    );
+
+    // ledger trace (BET is negative amount)
+    await client.query(
+      `INSERT INTO dos_ledger (player_id, type, amount, meta)
+       VALUES ($1,'BET',$2,$3)`,
+      [playerId, -Math.floor(amount), JSON.stringify({ roundId, choice, betId: b.rows[0].id })]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      roundId,
+      bet: b.rows[0],
+      balanceBefore: balance,
+      balanceAfter: newBalance
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    return res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
 // GET /api/player/:playerId/ledger
 app.get("/api/player/:playerId/ledger", async (req, res) => {
   try {
