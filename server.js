@@ -655,5 +655,42 @@ app.post("/api/admin/players/:id/status", requireAdmin, async (req, res) => {
     client.release();
   }
 });
+// ===================== ADMIN: PLAYER STATUS =====================
+// POST /api/admin/player/status
+// body: { "playerId": 1, "status": "ACTIVE" | "SUSPENDED" }
+app.post("/api/admin/player/status", requireAdmin, async (req, res) => {
+  try {
+    const playerId = Number(req.body?.playerId);
+    const status = String(req.body?.status || "").trim().toUpperCase();
+
+    if (!playerId) {
+      return res.status(400).json({ error: "playerId requis" });
+    }
+
+    const ALLOWED = new Set(["ACTIVE", "SUSPENDED"]);
+    if (!ALLOWED.has(status)) {
+      return res.status(400).json({
+        error: "status invalide",
+        allowed: Array.from(ALLOWED),
+      });
+    }
+
+    const up = await pool.query(
+      `UPDATE players
+       SET status = $1
+       WHERE id = $2
+       RETURNING id, username, balance_dos, status, created_at`,
+      [status, playerId]
+    );
+
+    if (up.rowCount === 0) {
+      return res.status(404).json({ error: "player not found" });
+    }
+
+    return res.json({ ok: true, player: up.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
 // ====== START ======
 app.listen(PORT, () => console.log(`✅ ddj-api listening on ${PORT}`));
