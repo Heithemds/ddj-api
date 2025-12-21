@@ -91,6 +91,34 @@ export async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_bets_player_round
       ON bets(player_id, round_id);
     `);
+    // ===== bets: settlement fields =====
+await client.query(`
+  ALTER TABLE bets
+  ADD COLUMN IF NOT EXISTS settled BOOLEAN NOT NULL DEFAULT false;
+`);
+
+await client.query(`
+  ALTER TABLE bets
+  ADD COLUMN IF NOT EXISTS outcome TEXT;
+`);
+
+await client.query(`
+  ALTER TABLE bets
+  ADD COLUMN IF NOT EXISTS payout_dos BIGINT NOT NULL DEFAULT 0;
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_bets_settled
+  ON bets(settled);
+`);
+// ===== round_results: anti double settle =====
+await client.query(`
+  CREATE TABLE IF NOT EXISTS round_results (
+    round_id BIGINT PRIMARY KEY,
+    outcome TEXT NOT NULL,
+    settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+`);
 
     await client.query("COMMIT");
     console.log("✅ initDb OK");
