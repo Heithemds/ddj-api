@@ -296,5 +296,149 @@ app.get("/api/admin/players", requireAdmin, async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
+// ===========================
+// ADMIN: ACTIONS JOUEURS
+// ===========================
+
+// Helper: fetch player (admin)
+async function getPlayerById(id) {
+  const r = await pool.query(
+    `SELECT id, username, balance_dos, status, created_at
+     FROM players WHERE id=$1`,
+    [id]
+  );
+  return r.rowCount ? r.rows[0] : null;
+}
+
+// 1) Ajouter des DOS
+app.post("/api/admin/players/:id/add-dos", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const amount = Number(req.body?.amount);
+  const note = String(req.body?.note || "").trim();
+
+  if (!id) return res.status(400).json({ error: "id invalide" });
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "amount > 0 requis" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const p = await client.query(`SELECT id, balance_dos, status FROM players WHERE id=$1 FOR UPDATE`, [id]);
+    if (p.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "joueur introuvable" });
+    }
+    if (p.rows[0].status === "SUSPENDED") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "joueur suspendu" });
+    }
+
+    const up = await client.query(
+      `UPDATE players SET balance_dos = balance_dos + $2 WHERE id=$1
+       RETURNING id, username, balance_dos, status, created_at`,
+      [id, amount]
+    );
+
+    await client.query(
+      `INSERT INTO dos_ledger (player_id, type, amount, meta)
+       VALUES ($1, 'ADMIN_ADD', $2, $3::jsonb)`,
+      [id, amount, JSON.stringify({ note })]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, player: up.rows[0] });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
+// 2) Fixer le solde (set)
+app.post("/api/admin/players/:id/set-dos", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const balance = Number(req.body?.balance);
+  const note = String(req.body?.note || "").trim();
+
+  if (!id) return res.status(400).json({ error: "id invalide" });
+  if (!Number.isFinite(balance) || balance < 0) return res.status(400).json({ error: "balance >= 0 requis" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const p = await client.query(`SELECT id, balance_dos FROM players WHERE id=$1 FOR UPDATE`, [id]);
+    if (p.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "joueur introuvable" });
+    }
+
+    const oldBal = Number(p.rows[0].balance_dos);
+    const delta = balance - oldBal;
+
+    const up = await client.query(
+      `UPDATE players SET balance_dos=$2 WHERE id=$1
+       RETURNING id, username, balance_dos, status, created_at`,
+      [id, balance]
+    );
+
+    await client.query(
+      `INSERT INTO dos_ledger (player_id, type, amount, meta)
+       VALUES ($1, 'ADMIN_SET', $2, $3::jsonb)`,
+      [id, delta, JSON.stringify({ note, oldBal, newBal: balance })]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, player: up.rows[0] });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
+// 3) Suspendre / Réactiver
+app.post("/api/admin/players/:id/status", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const status = String(req.body?.status || "").toUpperCase();
+
+  if (!id) return res.status(400).json({ error: "id invalide" });
+  if (!["ACTIVE", "SUSPENDED"].includes(status)) {
+    return res.status(400).json({ error: "status doit être ACTIVE ou SUSPENDED" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const p = await client.query(`SELECT id, status FROM players WHERE id=$1 FOR UPDATE`, [id]);
+    if (p.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "joueur introuvable" });
+    }
+
+    const up = await client.query(
+      `UPDATE players SET status=$2 WHERE id=$1
+       RETURNING id, username, balance_dos, status, created_at`,
+      [id, status]
+    );
+
+    await client.query(
+      `INSERT INTO dos_ledger (player_id, type, amount, meta)
+       VALUES ($1, 'ADMIN_STATUS', 0, $2::jsonb)`,
+      [id, JSON.stringify({ status })]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, player: up.rows[0] });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
 // ====== START ======
 app.listen(PORT, () => console.log(`✅ ddj-api listening on ${PORT}`));
