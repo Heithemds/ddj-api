@@ -14,7 +14,10 @@ export async function initDb() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
-
+await client.query(`
+  ALTER TABLE players
+  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';
+`);
     await client.query(`
       CREATE TABLE IF NOT EXISTS dos_ledger (
         id BIGSERIAL PRIMARY KEY,
