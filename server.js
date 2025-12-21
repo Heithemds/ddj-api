@@ -339,74 +339,60 @@ app.post("/api/bet", async (req, res) => {
 
   const playerId = Number(req.body?.playerId);
   const amount = Number(req.body?.amount);
-  const choice = String(req.body?.choice || "").trim().toUpperCase();
+  const nums = Array.isArray(req.body?.nums) ? req.body.nums.map(Number) : [];
+  const chance = Number(req.body?.chance);
 
-  if (!playerId) return res.status(400).json({ error: "playerId required" });
-  if (!Number.isFinite(amount) || amount <= 0)
-    return res.status(400).json({ error: "amount invalid" });
-  if (choice !== "A" && choice !== "B")
-    return res.status(400).json({ error: "choice invalid (A/B)" });
+  if (!Number.isFinite(playerId) || playerId <= 0) return res.status(400).json({ error: "playerId invalid" });
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "amount invalid" });
+
+  // validation combinaison
+  const uniqNums = [...new Set(nums)];
+  if (uniqNums.length !== 4) return res.status(400).json({ error: "nums must contain 4 distinct numbers" });
+  if (uniqNums.some((n) => !Number.isInteger(n) || n < 1 || n > 20)) return res.status(400).json({ error: "nums range 1..20" });
+  if (!Number.isInteger(chance) || chance < 1 || chance > 5) return res.status(400).json({ error: "chance range 1..5" });
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
     const p = await client.query(
-      `SELECT id, username, balance_dos, status
-       FROM players
-       WHERE id=$1
-       FOR UPDATE`,
+      `SELECT id, balance_dos, status FROM players WHERE id=$1 FOR UPDATE`,
       [playerId]
     );
-
     if (p.rowCount === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "player not found" });
     }
-
-    const player = p.rows[0];
-    if (player.status !== "ACTIVE") {
+    if (p.rows[0].status !== "ACTIVE") {
       await client.query("ROLLBACK");
-      return res.status(403).json({ error: "player not active", status: player.status });
+      return res.status(403).json({ error: "player not active", status: p.rows[0].status });
     }
 
-    const balance = Number(player.balance_dos);
-    if (balance < amount) {
+    const balanceBefore = Number(p.rows[0].balance_dos);
+    const cost = Math.floor(amount);
+
+    if (balanceBefore < cost) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "insufficient balance", balance });
+      return res.status(409).json({ error: "insufficient balance", balance: balanceBefore, cost });
     }
 
-    // 1 bet max par round / joueur
-    const existing = await client.query(
-      `SELECT id FROM bets WHERE player_id=$1 AND round_id=$2 LIMIT 1`,
-      [playerId, round.roundId]
-    );
-    if (existing.rowCount > 0) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "already bet this round", roundId: round.roundId });
-    }
-
+    // insert bet (1 combinaison = 1 ligne)
     const b = await client.query(
-      `INSERT INTO bets (player_id, round_id, choice, amount)
-       VALUES ($1,$2,$3,$4)
-       RETURNING id, player_id, round_id, choice, amount, created_at`,
-      [playerId, round.roundId, choice, Math.floor(amount)]
+      `INSERT INTO bets (player_id, round_id, nums, chance, amount)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, player_id, round_id, nums, chance, amount, created_at`,
+      [playerId, round.roundId, uniqNums, chance, cost]
     );
 
-    const newBalance = balance - Math.floor(amount);
-    await client.query(`UPDATE players SET balance_dos=$1 WHERE id=$2`, [
-      newBalance,
-      playerId,
-    ]);
+    // debit solde
+    const balanceAfter = balanceBefore - cost;
+    await client.query(`UPDATE players SET balance_dos=$1 WHERE id=$2`, [balanceAfter, playerId]);
 
+    // ledger BET
     await client.query(
       `INSERT INTO dos_ledger (player_id, type, amount, meta)
        VALUES ($1,'BET',$2,$3::jsonb)`,
-      [
-        playerId,
-        -Math.floor(amount),
-        JSON.stringify({ roundId: String(round.roundId), choice, betId: String(b.rows[0].id) }),
-      ]
+      [playerId, -cost, JSON.stringify({ roundId: String(round.roundId), betId: String(b.rows[0].id), nums: uniqNums, chance })]
     );
 
     await client.query("COMMIT");
@@ -415,13 +401,11 @@ app.post("/api/bet", async (req, res) => {
       ok: true,
       roundId: round.roundId,
       bet: b.rows[0],
-      balanceBefore: balance,
-      balanceAfter: newBalance,
+      balanceBefore,
+      balanceAfter,
     });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    try { await client.query("ROLLBACK"); } catch {}
     return res.status(500).json({ error: String(e?.message || e) });
   } finally {
     client.release();
