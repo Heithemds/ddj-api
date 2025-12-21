@@ -1,184 +1,132 @@
 import express from "express";
 import cors from "cors";
+import pg from "pg";
+
+const { Pool } = pg;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --------------------
-// Helpers / validation
-// --------------------
-function toInt(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.floor(n) : fallback;
+// ====== CONFIG ======
+const PORT = process.env.PORT || 3000;
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const DATABASE_URL = process.env.DATABASE_URL || "";
+
+// Bonus d'inscription (DOS)
+const SIGNUP_BONUS_DOS = parseInt(process.env.SIGNUP_BONUS_DOS || "50", 10);
+
+// Timing (en secondes) pour ton jeu (déjà existant chez toi)
+let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10);
+let closeBetsAt = parseInt(process.env.CLOSE_BETS_AT || "30", 10);
+let anchorMs = parseInt(process.env.ANCHOR_MS || String(Date.now()), 10);
+
+// ====== DB ======
+if (!DATABASE_URL) {
+  console.error("❌ DATABASE_URL manquant (Render env var).");
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+});
+
+async function initDb() {
+  // Tables simples : players + ledger (journal des mouvements DOS)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS players (
+      id BIGSERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      balance_dos BIGINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dos_ledger (
+      id BIGSERIAL PRIMARY KEY,
+      player_id BIGINT REFERENCES players(id) ON DELETE CASCADE,
+      type TEXT NOT NULL, -- BONUS_SIGNUP, WIN, PURCHASE, BET, ADJUST...
+      amount BIGINT NOT NULL,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("✅ DB ready");
 }
 
-function parseIsoToMs(iso) {
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? ms : null;
-}
+initDb().catch((e) => console.error("DB init error:", e));
 
-// --------------------
-// Config (env + runtime overrides)
-// --------------------
-const ENV_DEFAULTS = {
-  ROUND_SECONDS: clamp(toInt(process.env.ROUND_SECONDS, 300), 10, 86400),
-  CLOSE_BETS_AT: clamp(toInt(process.env.CLOSE_BETS_AT, 30), 1, 3600),
-  ANCHOR_MS: toInt(process.env.ANCHOR_MS, Date.UTC(2025, 0, 1, 0, 0, 0)),
-};
-
-// runtime overrides (⚠️ non persistants sur Render Free si redémarrage)
-let RUNTIME = {
-  roundSeconds: ENV_DEFAULTS.ROUND_SECONDS,
-  closeBetsAt: ENV_DEFAULTS.CLOSE_BETS_AT,
-  anchorMs: ENV_DEFAULTS.ANCHOR_MS,
-};
-
-function getConfig() {
-  // sécurité : closeBetsAt doit rester < roundSeconds
-  const roundSeconds = clamp(toInt(RUNTIME.roundSeconds, ENV_DEFAULTS.ROUND_SECONDS), 10, 86400);
-  const closeBetsAt = clamp(
-    toInt(RUNTIME.closeBetsAt, ENV_DEFAULTS.CLOSE_BETS_AT),
-    1,
-    Math.max(1, roundSeconds - 1)
-  );
-  const anchorMs = toInt(RUNTIME.anchorMs, ENV_DEFAULTS.ANCHOR_MS);
-
-  return { roundSeconds, closeBetsAt, anchorMs };
-}
-
-function getState(nowMs = Date.now()) {
-  const { roundSeconds, closeBetsAt, anchorMs } = getConfig();
-
-  const elapsedSec = Math.floor((nowMs - anchorMs) / 1000);
-  const inRound = ((elapsedSec % roundSeconds) + roundSeconds) % roundSeconds; // safe modulo
-  const remaining = roundSeconds - inRound;
-  const roundIndex = Math.floor(elapsedSec / roundSeconds) + 1;
-  const phase = remaining <= closeBetsAt ? "CLOSED" : "OPEN";
-
-  return {
-    round: roundIndex,
-    phase,
-    remaining,
-    roundSeconds,
-    closeBetsAt,
-    anchorMs,
-    serverTime: new Date(nowMs).toISOString(),
-  };
-}
-
-// --------------------
-// Admin auth
-// --------------------
+// ====== HELPERS ======
 function requireAdmin(req, res, next) {
-  const adminKey = process.env.ADMIN_KEY;
-
-  if (!adminKey) {
-    return res.status(500).json({
-      error: "ADMIN_KEY manquant côté Render (Environment Variables)",
-    });
-  }
-
-  // ✅ Header recommandé (depuis ton app admin)
-  const fromHeader = req.header("x-admin-key");
-
-  // ✅ Option pratique pour test rapide dans le navigateur (évite en prod)
-  const fromQuery = req.query.key;
-
-  const provided = String(fromHeader || fromQuery || "");
-
-  if (!provided || provided !== adminKey) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-
+  const k = req.headers["x-admin-key"];
+  if (!ADMIN_KEY || k !== ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
   next();
 }
 
-// --------------------
-// Routes
-// --------------------
-app.get("/api/health", (req, res) =>
-  res.json({ status: "ok", service: "ddj-api", version: "v1" })
-);
-
-app.get("/api/state", (req, res) => res.json(getState()));
-
-// public (safe)
-app.get("/api/config", (req, res) => {
-  const cfg = getConfig();
-  res.json({
-    roundSeconds: cfg.roundSeconds,
-    closeBetsAt: cfg.closeBetsAt,
-    anchorMs: cfg.anchorMs,
-    anchorIso: new Date(cfg.anchorMs).toISOString(),
-  });
+// ====== ROUTES ======
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", service: "ddj-api" });
 });
 
-// admin (protected)
 app.get("/api/admin/config", requireAdmin, (req, res) => {
-  const cfg = getConfig();
   res.json({
-    ...cfg,
-    anchorIso: new Date(cfg.anchorMs).toISOString(),
-    serverTime: new Date().toISOString(),
+    roundSeconds,
+    closeBetsAt,
+    anchorMs,
+    signupBonusDos: SIGNUP_BONUS_DOS,
   });
 });
 
-/**
- * PUT /api/admin/config
- * Body JSON (au choix) :
- * {
- *   "roundSeconds": 300,
- *   "closeBetsAt": 30,
- *   "anchorMs": 1735689600000,
- *   "anchorIso": "2026-01-01T00:00:00.000Z"
- * }
- */
 app.put("/api/admin/config", requireAdmin, (req, res) => {
-  const body = req.body || {};
+  const { roundSeconds: rs, closeBetsAt: cb, anchorMs: am } = req.body || {};
 
-  if (body.roundSeconds !== undefined) {
-    RUNTIME.roundSeconds = clamp(toInt(body.roundSeconds, RUNTIME.roundSeconds), 10, 86400);
-  }
+  if (Number.isFinite(rs)) roundSeconds = Math.max(30, Math.floor(rs));
+  if (Number.isFinite(cb)) closeBetsAt = Math.max(1, Math.floor(cb));
+  if (Number.isFinite(am)) anchorMs = Math.floor(am);
 
-  if (body.closeBetsAt !== undefined) {
-    // sera re-clampé par getConfig()
-    RUNTIME.closeBetsAt = clamp(toInt(body.closeBetsAt, RUNTIME.closeBetsAt), 1, 3600);
-  }
+  res.json({ ok: true, config: { roundSeconds, closeBetsAt, anchorMs } });
+});
 
-  if (body.anchorMs !== undefined) {
-    RUNTIME.anchorMs = toInt(body.anchorMs, RUNTIME.anchorMs);
-  }
+// ✅ ICI : signup joueur
+app.post("/api/player/signup", async (req, res) => {
+  try {
+    const username = String(req.body?.username || "").trim();
 
-  if (body.anchorIso !== undefined) {
-    const ms = parseIsoToMs(String(body.anchorIso));
-    if (ms === null) {
-      return res.status(400).json({ error: "anchorIso invalide (ISO attendu)" });
+    if (!username || username.length < 3) {
+      return res.status(400).json({ error: "username invalide (min 3 caractères)" });
     }
-    RUNTIME.anchorMs = ms;
+
+    // Crée le joueur
+    const created = await pool.query(
+      `INSERT INTO players (username, balance_dos)
+       VALUES ($1, $2)
+       RETURNING id, username, balance_dos, created_at`,
+      [username, SIGNUP_BONUS_DOS]
+    );
+
+    const player = created.rows[0];
+
+    // Enregistre le bonus dans le ledger
+    if (SIGNUP_BONUS_DOS > 0) {
+      await pool.query(
+        `INSERT INTO dos_ledger (player_id, type, amount, meta)
+         VALUES ($1, 'BONUS_SIGNUP', $2, $3)`,
+        [player.id, SIGNUP_BONUS_DOS, JSON.stringify({ source: "signup" })]
+      );
+    }
+
+    res.json({ ok: true, player });
+  } catch (e) {
+    // username déjà pris
+    if (String(e?.message || "").includes("duplicate key")) {
+      return res.status(409).json({ error: "username déjà utilisé" });
+    }
+    console.error(e);
+    res.status(500).json({ error: "server error" });
   }
-
-  const cfg = getConfig();
-  res.json({
-    ok: true,
-    config: {
-      ...cfg,
-      anchorIso: new Date(cfg.anchorMs).toISOString(),
-    },
-    state: getState(),
-  });
 });
 
-// Option : reset anchor à "maintenant" pour démarrer un nouveau cycle
-app.post("/api/admin/anchor/now", requireAdmin, (req, res) => {
-  RUNTIME.anchorMs = Date.now();
-  res.json({ ok: true, state: getState() });
-});
-
-// --------------------
-const PORT = toInt(process.env.PORT, 3000);
-app.listen(PORT, () => console.log(`DDJ API running on port ${PORT}`));
+// ====== START ======
+app.listen(PORT, () => console.log(`✅ ddj-api listening on ${PORT}`));
