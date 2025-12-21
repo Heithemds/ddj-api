@@ -1,11 +1,13 @@
 // initDb.js
-// initDb.js
 import { pool } from "./db.js";
 
 export async function initDb() {
   const client = await pool.connect();
   try {
-    // 1) Table players (si pas déjà)
+    // Sécurise des transactions propres
+    await client.query("BEGIN");
+
+    // 1) Players
     await client.query(`
       CREATE TABLE IF NOT EXISTS players (
         id SERIAL PRIMARY KEY,
@@ -15,11 +17,12 @@ export async function initDb() {
       );
     `);
 
-    // 2) Table gift_codes (codes cadeaux)
+    // 2) Gift codes (codes cadeaux)
+    // On stocke uniquement le hash (sha256) du code, jamais le code brut.
     await client.query(`
       CREATE TABLE IF NOT EXISTS gift_codes (
         id SERIAL PRIMARY KEY,
-        code_hash TEXT UNIQUE NOT NULL,
+        code_hash TEXT NOT NULL UNIQUE,
         amount_dos INT NOT NULL DEFAULT 50,
         redeemed_by INT NULL REFERENCES players(id) ON DELETE SET NULL,
         redeemed_at TIMESTAMPTZ NULL,
@@ -27,101 +30,19 @@ export async function initDb() {
       );
     `);
 
-    // 3) Index utile (optionnel mais pro)
+    // Index utile pour retrouver vite les codes non utilisés
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_gift_codes_redeemed_at
-      ON gift_codes(redeemed_at);
+      ON gift_codes (redeemed_at);
     `);
 
-    console.log("✅ DB init OK (players + gift_codes)");
+    await client.query("COMMIT");
+    console.log("✅ initDb OK : tables players + gift_codes");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ initDb ERROR:", err);
+    throw err;
   } finally {
     client.release();
   }
 }
-
-export async function initDb() {
-  // Tables de base (config, users, wallets, ledger, tickets)
-  await query(`
-    CREATE TABLE IF NOT EXISTS app_config (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      username TEXT UNIQUE NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS wallets (
-      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      balance NUMERIC(18, 2) NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  // Ledger = traçabilité (anti-fraude / audit)
-  await query(`
-    CREATE TABLE IF NOT EXISTS ledger (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      type TEXT NOT NULL, -- SIGNUP_BONUS / DEPOSIT / BET / WIN / TICKET_REDEEM / ADJUSTMENT
-      amount NUMERIC(18, 2) NOT NULL,
-      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await query(`
-    CREATE INDEX IF NOT EXISTS idx_ledger_user_id ON ledger(user_id);
-  `);
-
-  // Tickets cadeaux / promos (codes sécurisés)
-  await query(`
-    CREATE TABLE IF NOT EXISTS tickets (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      code_hash TEXT UNIQUE NOT NULL,
-      value NUMERIC(18,2) NOT NULL,
-      status TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE / REDEEMED / DISABLED
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      redeemed_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      redeemed_at TIMESTAMPTZ
-    );
-  `);
-
-  // Valeurs par défaut (si pas déjà présentes)
-  await query(
-    `INSERT INTO app_config(key, value)
-     VALUES
-      ('roundSeconds', '300'),
-      ('closeBetsAt', '30'),
-      ('signupBonus', '50')
-     ON CONFLICT (key) DO NOTHING;`
-  );
-
-  // Extension gen_random_uuid() (nécessaire sur certaines instances)
-  // Render Postgres l’a souvent déjà, mais on sécurise.
-  await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-}
-await client.query(`
-  ALTER TABLE players
-  ADD COLUMN IF NOT EXISTS tickets_count INT NOT NULL DEFAULT 12;
-`);
-await client.query(`
-  CREATE TABLE IF NOT EXISTS gift_codes (
-    id BIGSERIAL PRIMARY KEY,
-    code_hash TEXT UNIQUE NOT NULL,
-    value_dos BIGINT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE / REDEEMED / DISABLED
-    uses_remaining INT NOT NULL DEFAULT 1,
-    expires_at TIMESTAMPTZ NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    redeemed_by BIGINT NULL,
-    redeemed_at TIMESTAMPTZ NULL
-  );
-`);
