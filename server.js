@@ -96,6 +96,82 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", service: "ddj-api" });
 });
 // ====== ROUTES PUBLIC ======
+// PUBLIC: current round (time engine)
+app.get("/api/round", (req, res) => {
+  const nowMs = Date.now();
+
+  // Sécurisation minimale (au cas où)
+  const rs = Number.isFinite(roundSeconds) ? roundSeconds : 300;
+  const am = Number.isFinite(anchorMs) ? anchorMs : nowMs;
+
+  const roundLenMs = Math.max(30, Math.floor(rs)) * 1000;
+
+  // closeBetsAt = nombre de secondes AVANT la fin du round où on ferme les mises
+  const cba = Number.isFinite(closeBetsAt) ? Math.floor(closeBetsAt) : 30;
+  const closeSec = Math.max(0, Math.min(Math.floor(rs) - 1, cba));
+
+  const idx = Math.floor((nowMs - am) / roundLenMs);
+  const roundId = idx < 0 ? 0 : idx;
+
+  const roundStartMs = am + roundId * roundLenMs;
+  const roundEndMs = roundStartMs + roundLenMs;
+
+  const closeAtMs = roundEndMs - closeSec * 1000;
+  const betsOpen = nowMs < closeAtMs;
+
+  const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
+  const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
+
+  return res.json({
+    ok: true,
+    nowMs,
+    roundSeconds: Math.floor(rs),
+    closeBetsAt: closeSec,
+    anchorMs: am,
+    round: {
+      roundId,
+      roundStartMs,
+      roundEndMs,
+      closeAtMs,
+      betsOpen,
+      secondsLeft,
+      secondsToClose
+    }
+  });
+});
+// PUBLIC: current round state
+app.get("/api/round", (req, res) => {
+  const now = Date.now();
+
+  // “anchorMs” = origine temps (ms) pour caler les cycles
+  const elapsed = now - anchorMs;
+  const roundMs = roundSeconds * 1000;
+
+  // index de manche + timing
+  const roundIndex = Math.floor(elapsed / roundMs);
+  const roundStartMs = anchorMs + roundIndex * roundMs;
+  const roundEndMs = roundStartMs + roundMs;
+
+  // période de pari ouverte/fermée
+  const closeBetsMs = roundStartMs + closeBetsAt * 1000;
+  const betsOpen = now < closeBetsMs;
+
+  res.json({
+    ok: true,
+    now,
+    anchorMs,
+    roundSeconds,
+    closeBetsAt,
+    roundIndex,
+    roundStartMs,
+    closeBetsMs,
+    roundEndMs,
+    betsOpen,
+    // utile pour UI
+    secToClose: Math.max(0, Math.ceil((closeBetsMs - now) / 1000)),
+    secToEnd: Math.max(0, Math.ceil((roundEndMs - now) / 1000)),
+  });
+});
 // GET  /api/leaderboard
 // PUBLIC: leaderboard (top balances)
 // GET /api/leaderboard?limit=20
