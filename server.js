@@ -18,9 +18,65 @@ const SIGNUP_BONUS_DOS = parseInt(process.env.SIGNUP_BONUS_DOS || "50", 10);
 
 // Timing
 let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10);
-let closeBetsAt = parseInt(process.env.CLOSE_BETS_AT || "30", 10);
-let anchorMs = parseInt(process.env.ANCHOR_MS || String(Date.now()), 10);
+let closeBetsAt  = parseInt(process.env.CLOSE_BETS_AT || "30", 10);
+let anchorMs     = parseInt(process.env.ANCHOR_MS || String(Date.now()), 10);
+function getRoundInfo(nowMs = Date.now()) {
+  const roundMs = roundSeconds * 1000;
 
+  const roundId = Math.floor((nowMs - anchorMs) / roundMs);
+  const roundStartMs = anchorMs + roundId * roundMs;
+  const roundEndMs = roundStartMs + roundMs;
+
+  // ✅ fermeture des mises = X secondes AVANT la fin (FDJ-like)
+  const closeAtMs = roundEndMs - (closeBetsAt * 1000);
+
+  const betsOpen = nowMs < closeAtMs;
+  const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
+  const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
+
+  return { roundId, roundStartMs, roundEndMs, closeAtMs, betsOpen, secondsLeft, secondsToClose };
+}
+
+// ✅ Round helper (UNE SEULE fois dans tout le fichier)
+function getRoundInfo(nowMs = Date.now()) {
+  const roundMs = roundSeconds * 1000;
+
+  const roundId = Math.floor((nowMs - anchorMs) / roundMs);
+  const roundStartMs = anchorMs + roundId * roundMs;
+  const roundEndMs = roundStartMs + roundMs;
+
+  // fermeture des mises = X sec avant la fin
+  const closeAtMs = roundEndMs - (closeBetsAt * 1000);
+
+  const betsOpen = nowMs < closeAtMs;
+  const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
+  const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
+
+  return { roundId, roundStartMs, roundEndMs, closeAtMs, betsOpen, secondsLeft, secondsToClose };
+}
+// ----- Timing guardrails (anti-bug) -----
+if (!Number.isFinite(roundSeconds) || roundSeconds < 30) roundSeconds = 300;
+if (!Number.isFinite(closeBetsAt) || closeBetsAt < 1) closeBetsAt = 30;
+if (closeBetsAt >= roundSeconds) closeBetsAt = Math.max(1, roundSeconds - 1);
+if (!Number.isFinite(anchorMs)) anchorMs = Date.now();
+
+// ----- Round engine (single source of truth) -----
+function getRoundInfo(nowMs = Date.now()) {
+  const roundMs = roundSeconds * 1000;
+  
+  const roundId = Math.floor((nowMs - anchorMs) / roundMs);
+  const roundStartMs = anchorMs + roundId * roundMs;
+  const roundEndMs = roundStartMs + roundMs;
+  
+  // fermeture des mises = X secondes AVANT la fin
+  const closeAtMs = roundEndMs - (closeBetsAt * 1000);
+  
+  const betsOpen = nowMs < closeAtMs;
+  const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
+  const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
+  
+  return { roundId, roundStartMs, roundEndMs, closeAtMs, betsOpen, secondsLeft, secondsToClose };
+}
 // ====== DB ======
 if (!DATABASE_URL) console.error("❌ DATABASE_URL manquant (Render env var).");
 
