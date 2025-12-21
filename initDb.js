@@ -70,3 +70,7 @@ export async function initDb() {
   // Render Postgres l’a souvent déjà, mais on sécurise.
   await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 }
+await client.query(`
+  ALTER TABLE players
+  ADD COLUMN IF NOT EXISTS tickets_count INT NOT NULL DEFAULT 12;
+`);
