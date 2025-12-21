@@ -44,7 +44,53 @@ function requireAdmin(req, res, next) {
   if (!ADMIN_KEY || k !== ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
   next();
 }
+// ===========================
+// Anti-fraude: Rate limit redeem
+// ===========================
+const redeemLimiter = new Map();
+// clé = ip, valeur = { count, resetAtMs }
 
+function getClientIp(req) {
+  // Render/proxy: X-Forwarded-For peut contenir "ip, proxy, proxy"
+  const xf = String(req.headers["x-forwarded-for"] || "");
+  if (xf) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function redeemRateLimit(req, res, next) {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const windowMs = 60_000; // 1 minute
+  const max = 5;
+
+  const cur = redeemLimiter.get(ip);
+
+  if (!cur || now > cur.resetAtMs) {
+    redeemLimiter.set(ip, { count: 1, resetAtMs: now + windowMs });
+    return next();
+  }
+
+  if (cur.count >= max) {
+    const retryAfterSec = Math.ceil((cur.resetAtMs - now) / 1000);
+    res.setHeader("Retry-After", String(retryAfterSec));
+    return res.status(429).json({
+      error: "Too many attempts",
+      retryAfterSec,
+    });
+  }
+
+  cur.count += 1;
+  redeemLimiter.set(ip, cur);
+  next();
+}
+
+// Nettoyage mémoire (option pro)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, v] of redeemLimiter.entries()) {
+    if (now > v.resetAtMs) redeemLimiter.delete(ip);
+  }
+}, 60_000);
 // ====== ROUTES ======
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", service: "ddj-api" });
