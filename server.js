@@ -1,3 +1,4 @@
+import { generateTicketCode, hashTicketCode } from "./tickets.js";
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -130,3 +131,38 @@ app.post("/api/player/signup", async (req, res) => {
 
 // ====== START ======
 app.listen(PORT, () => console.log(`✅ ddj-api listening on ${PORT}`));
+function requireAdmin(req, res, next) {
+  const k = String(req.header("x-admin-key") || "");
+  if (!process.env.ADMIN_KEY || k !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  next();
+}
+
+app.post("/api/admin/gift-codes", requireAdmin, async (req, res) => {
+  try {
+    const count = Math.max(1, Math.min(200, Number(req.body?.count || 1)));
+    const valueDos = Math.max(1, Number(req.body?.valueDos || 50));
+    const expiresAt = req.body?.expiresAt ? new Date(req.body.expiresAt) : null;
+
+    const codes = [];
+
+    for (let i = 0; i < count; i++) {
+      const code = generateTicketCode(12);
+      const codeHash = hashTicketCode(code);
+
+      await pool.query(
+        `INSERT INTO gift_codes (code_hash, value_dos, expires_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (code_hash) DO NOTHING`,
+        [codeHash, valueDos, expiresAt ? expiresAt.toISOString() : null]
+      );
+
+      codes.push(code);
+    }
+
+    res.json({ ok: true, count: codes.length, valueDos, expiresAt, codes });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
