@@ -3,19 +3,33 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-if (!process.env.DATABASE_URL) {
-  console.warn("[DDJ] DATABASE_URL manquant. La DB ne pourra pas se connecter.");
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    throw new Error(`Missing environment variable: ${name}`);
+  }
+  return v;
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("render.com")
-    ? { rejectUnauthorized: false }
-    : undefined
+// Render fournit DATABASE_URL
+const DATABASE_URL = requireEnv("DATABASE_URL");
+
+// Sur Render Postgres, SSL est généralement requis en prod.
+// Sur certaines URLs "internal", ça peut marcher sans SSL, mais ce mode est safe.
+export const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("localhost") || DATABASE_URL.includes("127.0.0.1")
+    ? false
+    : { rejectUnauthorized: false },
 });
 
-export async function query(text, params) {
-  return pool.query(text, params);
+// Petit test de connexion au démarrage (log utile)
+export async function checkDb() {
+  const client = await pool.connect();
+  try {
+    const r = await client.query("SELECT NOW() as now");
+    console.log("✅ DB connected:", r.rows[0].now);
+  } finally {
+    client.release();
+  }
 }
-
-export { pool };
