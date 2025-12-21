@@ -405,6 +405,120 @@ app.get("/api/admin/stats", requireAdmin, async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
+// POST /api/admin/round/settle
+// Body: { roundId: 102144, outcome: "A" }   outcome = "A" ou "B"
+app.post("/api/admin/round/settle", requireAdmin, async (req, res) => {
+  try {
+    const roundId = Number(req.body?.roundId);
+    const outcome = String(req.body?.outcome || "").trim().toUpperCase();
+
+    if (!Number.isFinite(roundId) || roundId <= 0) {
+      return res.status(400).json({ error: "invalid roundId" });
+    }
+    if (outcome !== "A" && outcome !== "B") {
+      return res.status(400).json({ error: "invalid outcome (A/B)" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // 1) Anti double-settle (si déjà fait -> on refuse)
+      const already = await client.query(
+        `SELECT round_id FROM round_results WHERE round_id = $1`,
+        [roundId]
+      );
+      if (already.rowCount > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "round already settled", roundId });
+      }
+
+      // 2) Récupère toutes les bets du round (non réglées)
+      const bets = await client.query(
+        `
+        SELECT id, player_id, choice, amount
+        FROM bets
+        WHERE round_id = $1 AND settled = false
+        ORDER BY id ASC
+        `,
+        [roundId]
+      );
+
+      // 3) Marque le round comme “settled” (réservation)
+      await client.query(
+        `INSERT INTO round_results (round_id, outcome) VALUES ($1, $2)`,
+        [roundId, outcome]
+      );
+
+      let winners = 0;
+      let losers = 0;
+      let totalPayout = 0;
+
+      // Règle de payout: si gagné => payout = amount * 2 (retour mise + gain)
+      // Si perdu => payout = 0
+      for (const b of bets.rows) {
+        const isWin = String(b.choice).toUpperCase() === outcome;
+        const payout = isWin ? Number(b.amount) * 2 : 0;
+
+        await client.query(
+          `
+          UPDATE bets
+          SET settled = true,
+              outcome = $2,
+              payout_dos = $3
+          WHERE id = $1
+          `,
+          [b.id, outcome, payout]
+        );
+
+        if (payout > 0) {
+          winners += 1;
+          totalPayout += payout;
+
+          // crédite le joueur
+          await client.query(
+            `UPDATE players SET balance_dos = balance_dos + $1 WHERE id = $2`,
+            [payout, b.player_id]
+          );
+
+          // ledger WIN
+          await client.query(
+            `
+            INSERT INTO dos_ledger (player_id, type, amount, meta)
+            VALUES ($1, 'WIN', $2, $3::jsonb)
+            `,
+            [
+              b.player_id,
+              payout,
+              JSON.stringify({ betId: String(b.id), roundId: String(roundId), outcome }),
+            ]
+          );
+        } else {
+          losers += 1;
+        }
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        ok: true,
+        roundId,
+        outcome,
+        bets: bets.rowCount,
+        winners,
+        losers,
+        totalPayout,
+      });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
 // POST /api/admin/gift-codes
 // GET  /api/admin/stats
 // POST /api/admin/player/status
