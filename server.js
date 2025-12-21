@@ -332,7 +332,7 @@ app.post("/api/bet", async (req, res) => {
   const nowMs = Date.now();
   const round = getRoundInfo(nowMs);
   
-  // bets must be open according to the SAME logic as /api/round
+  // Timing: source de vérité = getRoundInfo()
   if (!round.betsOpen) {
     return res.status(409).json({
       error: "bets closed",
@@ -345,65 +345,61 @@ app.post("/api/bet", async (req, res) => {
   const amount = Number(req.body?.amount);
   
   if (!Number.isFinite(playerId) || playerId <= 0) {
-    return res.status(400).json({ error: "playerId required" });
+    return res.status(400).json({ error: "playerId invalid" });
   }
   if (!Number.isFinite(amount) || amount <= 0) {
     return res.status(400).json({ error: "amount invalid" });
   }
   
-  // ---- accept either (choice) or (nums+chance) ----
-  let betType = "CHOICE";
-  let choiceKey = "";
-  let betMeta = {};
+  // --- Nouveau format: combinaison nums+chance ---
+  const numsRaw = Array.isArray(req.body?.nums) ? req.body.nums : null;
+  const chanceRaw = req.body?.chance;
   
-  // New format: nums + chance
-  if (Array.isArray(req.body?.nums)) {
-    const nums = req.body.nums.map(Number).filter(Number.isFinite);
-    const unique = [...new Set(nums)];
+  // (compat) Ancien format "choice" si besoin (optionnel)
+  const choice = String(req.body?.choice || "").trim().toUpperCase();
+  
+  let nums = null;
+  let chance = null;
+  let choiceKey = null;
+  
+  if (numsRaw) {
+    const parsed = numsRaw.map(Number).filter(Number.isFinite);
+    const unique = [...new Set(parsed)];
     
-    // règle simple (tu pourras ajuster): 4 numéros uniques
     if (unique.length !== 4) {
-      return res.status(400).json({ error: "nums must contain 4 unique numbers" });
+      return res.status(400).json({ error: "nums must contain 4 distinct numbers" });
     }
-    
-    // optionnel: borne 1..20 (tu peux changer)
     for (const n of unique) {
       if (!Number.isInteger(n) || n < 1 || n > 20) {
-        return res.status(400).json({ error: "nums must be integers between 1 and 20" });
+        return res.status(400).json({ error: "nums must be integers 1..20" });
       }
     }
     
-    const chance = Number(req.body?.chance);
-    if (!Number.isFinite(chance) || !Number.isInteger(chance) || chance < 0) {
-      return res.status(400).json({ error: "chance invalid" });
+    chance = Number(chanceRaw);
+    if (!Number.isInteger(chance) || chance < 1 || chance > 5) {
+      return res.status(400).json({ error: "chance must be integer 1..5" });
     }
     
     unique.sort((a, b) => a - b);
-    betType = "NUMS";
-    // on stocke dans la colonne "choice" comme clé lisible (simple et efficace)
-    choiceKey = `${unique.join("-")}#${chance}`;
-    betMeta = { nums: unique, chance };
+    nums = unique;
+    choiceKey = `${nums.join("-")}#${chance}`; // juste pour debug/lecture (si tu veux)
   } else {
-    // Old format: choice
-    const choice = String(req.body?.choice || "").trim().toUpperCase();
-    if (!choice) return res.status(400).json({ error: "choice required" });
-    
-    // règle simple (tu peux élargir): A/B
-    if (!["A", "B"].includes(choice)) {
-      return res.status(400).json({ error: "choice must be A or B" });
-    }
+    // si tu veux garder l'ancien mode A/B temporairement
+    if (!choice) return res.status(400).json({ error: "nums+chance required (or choice)" });
+    if (!["A", "B"].includes(choice)) return res.status(400).json({ error: "choice must be A or B" });
     choiceKey = choice;
-    betMeta = { choice };
   }
   
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     
+    // Lock joueur
     const p = await client.query(
       `SELECT id, balance_dos, status
        FROM players
-       WHERE id = $1`,
+       WHERE id=$1
+       FOR UPDATE`,
       [playerId]
     );
     
@@ -411,71 +407,59 @@ app.post("/api/bet", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "player not found" });
     }
-    
-    const player = p.rows[0];
-    if (player.status !== "ACTIVE") {
+    if (p.rows[0].status !== "ACTIVE") {
       await client.query("ROLLBACK");
-      return res.status(403).json({ error: "player inactive" });
+      return res.status(403).json({ error: "player not active", status: p.rows[0].status });
     }
     
-    const balanceBefore = Number(player.balance_dos);
-    if (!Number.isFinite(balanceBefore) || balanceBefore < amount) {
+    const balanceBefore = Number(p.rows[0].balance_dos);
+    const cost = Math.floor(amount);
+    
+    if (balanceBefore < cost) {
       await client.query("ROLLBACK");
-      return res.status(409).json({
-        error: "insufficient funds",
-        balance: balanceBefore,
-        required: amount,
-      });
+      return res.status(409).json({ error: "insufficient balance", balance: balanceBefore, cost });
     }
     
-    // 1) insert bet
-    const betRes = await client.query(
-      `INSERT INTO bets (player_id, round_id, choice, amount, created_at)
-       VALUES ($1, $2, $3, $4, NOW())
-       RETURNING id, player_id, round_id, choice, amount, created_at`,
-      [playerId, round.roundId, choiceKey, amount]
+    // ✅ Insert bet (combinaison) — illimité, aucune règle "already bet"
+    const b = await client.query(
+      `INSERT INTO bets (player_id, round_id, nums, chance, choice, amount, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())
+       RETURNING id, player_id, round_id, nums, chance, choice, amount, created_at`,
+      [playerId, round.roundId, nums, chance, choiceKey, cost]
     );
     
-    const betRow = betRes.rows[0];
+    // Débit solde
+    const balanceAfter = balanceBefore - cost;
+    await client.query(`UPDATE players SET balance_dos=$1 WHERE id=$2`, [balanceAfter, playerId]);
     
-    // 2) ledger
+    // Ledger
     await client.query(
       `INSERT INTO dos_ledger (player_id, type, amount, meta)
-       VALUES ($1, 'BET', $2, $3::jsonb)`,
+       VALUES ($1,'BET',$2,$3::jsonb)`,
       [
         playerId,
-        -Math.abs(amount),
+        -cost,
         JSON.stringify({
-          betId: String(betRow.id),
-          roundId: round.roundId,
-          betType,
-          ...betMeta,
+          betId: String(b.rows[0].id),
+          roundId: String(round.roundId),
+          nums,
+          chance,
+          choice: choiceKey,
         }),
       ]
     );
-    
-    // 3) update balance
-    const upd = await client.query(
-      `UPDATE players
-       SET balance_dos = balance_dos - $2
-       WHERE id = $1
-       RETURNING balance_dos`,
-      [playerId, amount]
-    );
-    
-    const balanceAfter = Number(upd.rows[0].balance_dos);
     
     await client.query("COMMIT");
     
     return res.json({
       ok: true,
       roundId: round.roundId,
-      bet: betRow,
+      bet: b.rows[0],
       balanceBefore,
       balanceAfter,
     });
   } catch (e) {
-    await client.query("ROLLBACK");
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("❌ /api/bet ERROR:", e);
     return res.status(500).json({ error: String(e?.message || e) });
   } finally {
