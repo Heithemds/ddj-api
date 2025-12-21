@@ -180,7 +180,7 @@ app.post("/api/admin/gift-codes", requireAdmin, async (req, res) => {
 });
 
 // PLAYER: redeem un code cadeau
-app.post("/api/player/redeem", async (req, res) => {
+app.post("/api/player/redeem", redeemRateLimit, async (req, res) => {
   const playerId = Number(req.body?.playerId);
   const code = String(req.body?.code || "").trim().toUpperCase();
 
