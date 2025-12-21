@@ -2,7 +2,9 @@ import { generateTicketCode, hashTicketCode } from "./tickets.js";
 import express from "express";
 import cors from "cors";
 import pg from "pg";
+import { initDb } from "./initDb.js";
 
+await initDb(); // si ton fichier est en module ES (type: "module")
 const { Pool } = pg;
 
 const app = express();
