@@ -95,6 +95,102 @@ setInterval(() => {
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", service: "ddj-api" });
 });
+// ====== ROUTES PUBLIC ======
+// GET  /api/leaderboard
+// GET /api/leaderboard?limit=20
+app.get("/api/leaderboard", async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(100, Number(req.query?.limit || 20)));
+
+    const r = await pool.query(
+      `SELECT id, username, balance_dos, status, created_at
+       FROM players
+       WHERE status = 'ACTIVE'
+       ORDER BY balance_dos DESC, id ASC
+       LIMIT $1`,
+      [limit]
+    );
+
+    res.json({ ok: true, limit, rows: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+// ====== ROUTES PLAYER ======
+// GET /api/player/:playerId/ledger?limit=50
+app.get("/api/player/:playerId/ledger", async (req, res) => {
+  try {
+    const playerId = Number(req.params.playerId);
+    if (!playerId) return res.status(400).json({ error: "playerId invalide" });
+
+    const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 50)));
+
+    // Vérifie joueur
+    const p = await pool.query(
+      `SELECT id, username, balance_dos, status, created_at
+       FROM players
+       WHERE id = $1`,
+      [playerId]
+    );
+    if (p.rowCount === 0) return res.status(404).json({ error: "player not found" });
+
+    // Ledger
+    const l = await pool.query(
+      `SELECT id, type, amount, meta, created_at
+       FROM dos_ledger
+       WHERE player_id = $1
+       ORDER BY id DESC
+       LIMIT $2`,
+      [playerId, limit]
+    );
+
+    res.json({ ok: true, player: p.rows[0], limit, ledger: l.rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+// POST /api/player/signup
+// POST /api/player/redeem
+// GET  /api/player/:playerId/ledger
+// ====== ROUTES ADMIN ======
+// GET /api/admin/stats
+app.get("/api/admin/stats", requireAdmin, async (req, res) => {
+  try {
+    const playersTotal = await pool.query(`SELECT COUNT(*)::bigint AS n FROM players`);
+    const playersActive = await pool.query(`SELECT COUNT(*)::bigint AS n FROM players WHERE status='ACTIVE'`);
+    const playersSuspended = await pool.query(`SELECT COUNT(*)::bigint AS n FROM players WHERE status='SUSPENDED'`);
+
+    const dosTotal = await pool.query(`SELECT COALESCE(SUM(balance_dos),0)::bigint AS n FROM players`);
+    const ledgerCount = await pool.query(`SELECT COUNT(*)::bigint AS n FROM dos_ledger`);
+
+    const redeemedCount = await pool.query(
+      `SELECT COUNT(*)::bigint AS n
+       FROM dos_ledger
+       WHERE type='REDEEM'`
+    );
+
+    res.json({
+      ok: true,
+      players: {
+        total: playersTotal.rows[0].n,
+        active: playersActive.rows[0].n,
+        suspended: playersSuspended.rows[0].n,
+      },
+      dos: {
+        totalInPlayers: dosTotal.rows[0].n,
+      },
+      ledger: {
+        totalRows: ledgerCount.rows[0].n,
+        redeemRows: redeemedCount.rows[0].n,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+// POST /api/admin/gift-codes
+// GET  /api/admin/stats
+// POST /api/admin/player/status
 
 app.get("/api/admin/config", requireAdmin, (req, res) => {
   res.json({ roundSeconds, closeBetsAt, anchorMs, signupBonusDos: SIGNUP_BONUS_DOS });
