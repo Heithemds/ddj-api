@@ -1,5 +1,43 @@
 // initDb.js
-import { query } from "./db.js";
+// initDb.js
+import { pool } from "./db.js";
+
+export async function initDb() {
+  const client = await pool.connect();
+  try {
+    // 1) Table players (si pas déjà)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS players (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        balance_dos INT NOT NULL DEFAULT 50,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // 2) Table gift_codes (codes cadeaux)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS gift_codes (
+        id SERIAL PRIMARY KEY,
+        code_hash TEXT UNIQUE NOT NULL,
+        amount_dos INT NOT NULL DEFAULT 50,
+        redeemed_by INT NULL REFERENCES players(id) ON DELETE SET NULL,
+        redeemed_at TIMESTAMPTZ NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // 3) Index utile (optionnel mais pro)
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_gift_codes_redeemed_at
+      ON gift_codes(redeemed_at);
+    `);
+
+    console.log("✅ DB init OK (players + gift_codes)");
+  } finally {
+    client.release();
+  }
+}
 
 export async function initDb() {
   // Tables de base (config, users, wallets, ledger, tickets)
