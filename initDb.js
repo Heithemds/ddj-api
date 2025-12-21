@@ -1,4 +1,3 @@
-// initDb.js
 import { pool } from "./db.js";
 
 export async function initDb() {
@@ -6,7 +5,7 @@ export async function initDb() {
   try {
     await client.query("BEGIN");
 
-    // ===== players =====
+    // players
     await client.query(`
       CREATE TABLE IF NOT EXISTS players (
         id BIGSERIAL PRIMARY KEY,
@@ -17,24 +16,12 @@ export async function initDb() {
       );
     `);
 
-    // Backward-compat (si la table existait déjà sans status)
-    await client.query(`
-      ALTER TABLE players
-      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';
-    `);
-
-    // (Optionnel mais utile) index pour filtres status/leaderboard
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_players_status_balance
-      ON players(status, balance_dos DESC);
-    `);
-
-    // ===== dos_ledger =====
+    // dos_ledger
     await client.query(`
       CREATE TABLE IF NOT EXISTS dos_ledger (
         id BIGSERIAL PRIMARY KEY,
         player_id BIGINT REFERENCES players(id) ON DELETE CASCADE,
-        type TEXT NOT NULL, -- BONUS_SIGNUP, WIN, BET, ADMIN_ADD, ADMIN_STATUS, REDEEM...
+        type TEXT NOT NULL,
         amount BIGINT NOT NULL,
         meta JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -42,11 +29,11 @@ export async function initDb() {
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_dos_ledger_player_id_id_desc
+      CREATE INDEX IF NOT EXISTS idx_ledger_player_id_id
       ON dos_ledger(player_id, id DESC);
     `);
 
-    // ===== gift_codes =====
+    // gift_codes
     await client.query(`
       CREATE TABLE IF NOT EXISTS gift_codes (
         id BIGSERIAL PRIMARY KEY,
@@ -60,17 +47,9 @@ export async function initDb() {
       );
     `);
 
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_gift_codes_status
-      ON gift_codes(status);
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_gift_codes_status ON gift_codes(status);`);
 
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_gift_codes_expires_at
-      ON gift_codes(expires_at);
-    `);
-
-    // ===== bets (historique des mises par round) =====
+    // bets
     await client.query(`
       CREATE TABLE IF NOT EXISTS bets (
         id BIGSERIAL PRIMARY KEY,
@@ -78,47 +57,23 @@ export async function initDb() {
         round_id BIGINT NOT NULL,
         choice TEXT NOT NULL,
         amount BIGINT NOT NULL CHECK (amount > 0),
+        settled BOOLEAN NOT NULL DEFAULT false,
+        payout_dos BIGINT NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_bets_round_id ON bets(round_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_bets_settled ON bets(settled);`);
+
+    // round_results (IMPORTANT: colonne outcome)
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bets_round_id
-      ON bets(round_id);
+      CREATE TABLE IF NOT EXISTS round_results (
+        round_id BIGINT PRIMARY KEY,
+        outcome TEXT NOT NULL,
+        settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_bets_player_round
-      ON bets(player_id, round_id);
-    `);
-    // ===== bets: settlement fields =====
-await client.query(`
-  ALTER TABLE bets
-  ADD COLUMN IF NOT EXISTS settled BOOLEAN NOT NULL DEFAULT false;
-`);
-
-await client.query(`
-  ALTER TABLE bets
-  ADD COLUMN IF NOT EXISTS outcome TEXT;
-`);
-
-await client.query(`
-  ALTER TABLE bets
-  ADD COLUMN IF NOT EXISTS payout_dos BIGINT NOT NULL DEFAULT 0;
-`);
-
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_bets_settled
-  ON bets(settled);
-`);
-// ===== round_results: anti double settle =====
-await client.query(`
-  CREATE TABLE IF NOT EXISTS round_results (
-    round_id BIGINT PRIMARY KEY,
-    outcome TEXT NOT NULL,
-    settled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );
-`);
 
     await client.query("COMMIT");
     console.log("✅ initDb OK");
