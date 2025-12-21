@@ -74,3 +74,16 @@ await client.query(`
   ALTER TABLE players
   ADD COLUMN IF NOT EXISTS tickets_count INT NOT NULL DEFAULT 12;
 `);
+await client.query(`
+  CREATE TABLE IF NOT EXISTS gift_codes (
+    id BIGSERIAL PRIMARY KEY,
+    code_hash TEXT UNIQUE NOT NULL,
+    value_dos BIGINT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE / REDEEMED / DISABLED
+    uses_remaining INT NOT NULL DEFAULT 1,
+    expires_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    redeemed_by BIGINT NULL,
+    redeemed_at TIMESTAMPTZ NULL
+  );
+`);
