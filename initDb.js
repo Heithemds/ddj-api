@@ -4,44 +4,49 @@ import { pool } from "./db.js";
 export async function initDb() {
   const client = await pool.connect();
   try {
-    // Sécurise des transactions propres
     await client.query("BEGIN");
 
-    // 1) Players
     await client.query(`
       CREATE TABLE IF NOT EXISTS players (
-        id SERIAL PRIMARY KEY,
+        id BIGSERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
-        balance_dos INT NOT NULL DEFAULT 50,
+        balance_dos BIGINT NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
-    // 2) Gift codes (codes cadeaux)
-    // On stocke uniquement le hash (sha256) du code, jamais le code brut.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS dos_ledger (
+        id BIGSERIAL PRIMARY KEY,
+        player_id BIGINT REFERENCES players(id) ON DELETE CASCADE,
+        type TEXT NOT NULL, -- BONUS_SIGNUP, WIN, BET, ADJUST, REDEEM...
+        amount BIGINT NOT NULL,
+        meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS gift_codes (
-        id SERIAL PRIMARY KEY,
-        code_hash TEXT NOT NULL UNIQUE,
-        amount_dos INT NOT NULL DEFAULT 50,
-        redeemed_by INT NULL REFERENCES players(id) ON DELETE SET NULL,
+        id BIGSERIAL PRIMARY KEY,
+        code_hash TEXT UNIQUE NOT NULL,
+        value_dos BIGINT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE / REDEEMED / DISABLED
+        expires_at TIMESTAMPTZ NULL,
+        redeemed_by BIGINT NULL REFERENCES players(id) ON DELETE SET NULL,
         redeemed_at TIMESTAMPTZ NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
-    // Index utile pour retrouver vite les codes non utilisés
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_gift_codes_redeemed_at
-      ON gift_codes (redeemed_at);
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_gift_codes_status ON gift_codes(status);`);
 
     await client.query("COMMIT");
-    console.log("✅ initDb OK : tables players + gift_codes");
-  } catch (err) {
+    console.log("✅ initDb OK");
+  } catch (e) {
     await client.query("ROLLBACK");
-    console.error("❌ initDb ERROR:", err);
-    throw err;
+    console.error("❌ initDb ERROR:", e);
+    throw e;
   } finally {
     client.release();
   }
