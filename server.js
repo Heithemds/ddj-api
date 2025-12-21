@@ -418,14 +418,19 @@ app.get("/api/admin/config", requireAdmin, (req, res) => {
 });
 
 app.put("/api/admin/config", requireAdmin, (req, res) => {
-  const { roundSeconds: rs, closeBetsAt: cb, anchorMs: am } = req.body || {};
+  // Coercition robuste (accepte number ET string)
+  const rs = Number(req.body?.roundSeconds);
+  const cb = Number(req.body?.closeBetsAt);
+  const am = Number(req.body?.anchorMs);
 
   if (Number.isFinite(rs)) roundSeconds = Math.max(30, Math.floor(rs));
-  if (Number.isFinite(cb)) closeBetsAt = Math.max(1, Math.floor(cb));
-  if (closeBetsAt >= roundSeconds) closeBetsAt = Math.max(1, roundSeconds - 1);
-  if (Number.isFinite(am)) anchorMs = Math.floor(am);
+  if (Number.isFinite(cb)) closeBetsAt  = Math.max(1, Math.floor(cb));
+  if (Number.isFinite(am)) anchorMs     = Math.floor(am);
 
-  res.json({ ok: true, config: { roundSeconds, closeBetsAt, anchorMs } });
+  // garde-fou: closeBetsAt doit être < roundSeconds
+  if (closeBetsAt >= roundSeconds) closeBetsAt = Math.max(1, roundSeconds - 1);
+
+  return res.json({ ok: true, config: { roundSeconds, closeBetsAt, anchorMs } });
 });
 
 // ADMIN: générer des codes cadeaux
