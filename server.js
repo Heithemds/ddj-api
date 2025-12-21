@@ -176,7 +176,13 @@ app.get("/api/player/:playerId/ledger", async (req, res) => {
       [playerId, limit]
     );
 
-    res.json({ ok: true, player: p.rows[0], ledger: led.rows });
+    res.json({
+  ok: true,
+  player: p.rows[0],
+  limit,
+  count: led.rowCount,
+  ledger: led.rows
+});
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
