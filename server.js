@@ -97,6 +97,7 @@ app.get("/api/health", (req, res) => {
 });
 // ====== ROUTES PUBLIC ======
 // GET  /api/leaderboard
+// PUBLIC: leaderboard (top balances)
 // GET /api/leaderboard?limit=20
 app.get("/api/leaderboard", async (req, res) => {
   try {
