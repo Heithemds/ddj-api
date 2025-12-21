@@ -207,6 +207,94 @@ app.post("/api/player/redeem", async (req, res) => {
     client.release();
   }
 });
+// ===========================
+// ADMIN DASHBOARD (DOS KPIs)
+// ===========================
+app.get("/api/admin/stats", requireAdmin, async (req, res) => {
+  try {
+    const [playersCount, balancesSum, distributed, redeemed, codes] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::bigint AS players_count FROM players`),
+      pool.query(`SELECT COALESCE(SUM(balance_dos),0)::bigint AS dos_in_players FROM players`),
+      pool.query(`
+        SELECT COALESCE(SUM(amount),0)::bigint AS dos_distributed
+        FROM dos_ledger
+        WHERE type IN ('BONUS_SIGNUP','REDEEM')
+      `),
+      pool.query(`
+        SELECT COALESCE(SUM(value_dos),0)::bigint AS dos_redeemed
+        FROM gift_codes
+        WHERE status='REDEEMED'
+      `),
+      pool.query(`
+        SELECT
+          COUNT(*)::bigint AS total_codes,
+          COALESCE(SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END),0)::bigint AS active_codes,
+          COALESCE(SUM(CASE WHEN status='REDEEMED' THEN 1 ELSE 0 END),0)::bigint AS redeemed_codes
+        FROM gift_codes
+      `),
+    ]);
 
+    res.json({
+      ok: true,
+      stats: {
+        playersCount: playersCount.rows[0].players_count,
+        dosInPlayers: balancesSum.rows[0].dos_in_players,
+        dosDistributed: distributed.rows[0].dos_distributed,
+        dosRedeemed: redeemed.rows[0].dos_redeemed,
+        codes: codes.rows[0],
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// ===========================
+// ADMIN: LISTE JOUEURS
+// - pagination + recherche
+// ===========================
+app.get("/api/admin/players", requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const q = String(req.query.q || "").trim();
+
+    const params = [];
+    let where = "";
+    if (q) {
+      params.push(`%${q}%`);
+      where = `WHERE username ILIKE $${params.length}`;
+    }
+
+    params.push(limit);
+    params.push(offset);
+
+    const sql = `
+      SELECT id, username, balance_dos, created_at
+      FROM players
+      ${where}
+      ORDER BY created_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `;
+
+    const r = await pool.query(sql, params);
+
+    // total (pour pagination)
+    const total = await pool.query(
+      `SELECT COUNT(*)::bigint AS total FROM players ${where}`,
+      q ? [`%${q}%`] : []
+    );
+
+    res.json({
+      ok: true,
+      total: total.rows[0].total,
+      limit,
+      offset,
+      players: r.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
 // ====== START ======
 app.listen(PORT, () => console.log(`✅ ddj-api listening on ${PORT}`));
