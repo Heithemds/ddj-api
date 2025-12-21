@@ -142,6 +142,22 @@ app.post("/api/player/redeem", async (req, res) => {
   if (!/^[A-Z0-9]{12}$/.test(code)) return res.status(400).json({ error: "code invalide (12)" });
 
   const client = await pool.connect();
+// ====== PLAYER STATUS CHECK ======
+    const p = await client.query(
+      "SELECT status FROM players WHERE id = $1",
+      [playerId]
+    );
+
+    if (p.rowCount === 0) {
+      client.release();
+      return res.status(404).json({ error: "player not found" });
+    }
+
+    if (p.rows[0].status !== "ACTIVE") {
+      client.release();
+      return res.status(403).json({ error: "player not active" });
+    }
+    // ====== END PLAYER STATUS CHECK ======
   try {
     await client.query("BEGIN");
 
