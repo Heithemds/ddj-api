@@ -102,4 +102,3 @@ export async function initDb() {
     client.release();
   }
 }
-```0
