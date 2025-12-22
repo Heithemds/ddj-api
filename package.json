@@ -1,14 +1,13 @@
 {
-  "name": "ddj-api",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
+  "name": "ddj",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
   "scripts": {
-    "start": "node server.js"
+    "dev:api": "npm -w @ddj/api run dev",
+    "dev:player": "npm -w @ddj/player run dev",
+    "dev": "concurrently -n API,PLAYER \"npm -w @ddj/api run dev\" \"npm -w @ddj/player run dev\""
   },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "pg": "^8.12.0"
+  "devDependencies": {
+    "concurrently": "^9.0.0"
   }
 }
