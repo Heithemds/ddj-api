@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16
+    container_name: ddj-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ddj
+    ports:
+      - "5432:5432"
+    volumes:
+      - ddj_pgdata:/var/lib/postgresql/data
+volumes:
+  ddj_pgdata:
