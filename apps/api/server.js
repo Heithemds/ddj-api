@@ -1,4 +1,5 @@
 // server.js
+import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
