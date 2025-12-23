@@ -9,6 +9,8 @@ import { initDb } from "./initDb.js";
 import { generateTicketCode, hashTicketCode } from "./tickets.js";
 
 const app = express();
+app.get("/health", (req, res) => res.json({ status: "ok", service: "ddj-api", ts: new Date().toISOString() }));
+app.get("/api/v1/health", (req, res) => res.json({ status: "ok", service: "ddj-api", ts: new Date().toISOString() }));
 app.use(express.json());
 
 // ====== CONFIG ======
