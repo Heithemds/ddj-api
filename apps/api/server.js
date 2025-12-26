@@ -8,6 +8,77 @@ import { pool } from "./db.js";
 import { initDb } from "./initDb.js";
 import { generateTicketCode, hashTicketCode } from "./tickets.js";
 
+const SECRET_SEED = process.env.SECRET_SEED || "dev-secret";
+
+function base64urlEncode(input) {
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input));
+  return buf.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+function base64urlDecode(str) {
+  str = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  return Buffer.from(str, "base64");
+}
+
+function hashPin(pin) {
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(String(pin) + SECRET_SEED, salt, 32);
+  return `scrypt$${salt.toString("base64")}$${derived.toString("base64")}`;
+}
+
+function verifyPin(pin, stored) {
+  try {
+    if (!stored) return false;
+    const [tag, saltB64, hashB64] = String(stored).split("$");
+    if (tag !== "scrypt" || !saltB64 || !hashB64) return false;
+    const salt = Buffer.from(saltB64, "base64");
+    const expected = Buffer.from(hashB64, "base64");
+    const derived = crypto.scryptSync(String(pin) + SECRET_SEED, salt, expected.length);
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+
+function signPlayerToken(payload) {
+  const p = base64urlEncode(JSON.stringify(payload));
+  const sig = crypto.createHmac("sha256", SECRET_SEED).update(p).digest();
+  return `${p}.${base64urlEncode(sig)}`;
+}
+
+function verifyPlayerToken(token) {
+  if (!token) return null;
+  const [p, s] = String(token).split(".");
+  if (!p || !s) return null;
+
+  const expected = base64urlEncode(crypto.createHmac("sha256", SECRET_SEED).update(p).digest());
+  const a = Buffer.from(expected);
+  const b = Buffer.from(s);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+  const payload = JSON.parse(base64urlDecode(p).toString("utf8"));
+  if (!payload?.pid || !payload?.exp) return null;
+  if (Date.now() > payload.exp) return null;
+
+  return payload;
+}
+
+async function getAuthedPlayer(req) {
+  const h = req.headers.authorization || "";
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  if (!m) return null;
+  const decoded = verifyPlayerToken(m[1]);
+  if (!decoded) return null;
+
+  const r = await pool.query(
+    "SELECT id, username, status, balance_dos, type, pin_hash FROM players WHERE id=$1",
+    [decoded.pid]
+  );
+  if (r.rowCount === 0) return null;
+  const p = r.rows[0];
+  if (p.status !== "ACTIVE") return null;
+  return p;
+}
 const app = express();
 app.get("/health", (req, res) => res.json({ status: "ok", service: "ddj-api", ts: new Date().toISOString() }));
 app.get("/api/v1/health", (req, res) => res.json({ status: "ok", service: "ddj-api", ts: new Date().toISOString() }));
@@ -18,7 +89,48 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const SIGNUP_BONUS_DOS = parseInt(process.env.SIGNUP_BONUS_DOS || "50", 10);
-const SECRET_SEED = process.env.SECRET_SEED || ""; // pour RNG déterministe
+const DOS_UNIT = BigInt(process.env.DOS_UNIT || "10");               // 1 DOS = 10 unités
+const TRANSFER_FEE_UNITS = BigInt(process.env.TRANSFER_FEE_UNITS || "5"); // 0.5 DOS
+
+function isPowerOf10(n) {
+  let x = n;
+  while (x > 1n && x % 10n === 0n) x /= 10n;
+  return x === 1n;
+}
+
+function decimalsCount(scale) {
+  // scale doit être 10, 100, 1000...
+  if (!isPowerOf10(scale)) throw new Error("DOS_UNIT must be a power of 10 (10,100,1000...)");
+  return scale.toString().length - 1; // 10->1, 100->2, etc.
+}
+
+function parseDosToUnits(dosInput) {
+  const s = String(dosInput ?? "").trim();
+  if (!s) throw new Error("amount_dos required");
+  if (!/^\d+(\.\d+)?$/.test(s)) throw new Error("invalid DOS amount");
+
+  const dCount = decimalsCount(DOS_UNIT);
+  const [intPart, decRaw = ""] = s.split(".");
+  if (decRaw.length > dCount) throw new Error(`too many decimals (max ${dCount})`);
+
+  const decPart = (decRaw + "0".repeat(dCount)).slice(0, dCount); // pad à droite
+  return BigInt(intPart) * DOS_UNIT + BigInt(decPart || "0");
+}
+
+function formatUnitsToDos(unitsInput) {
+  const u = BigInt(unitsInput);
+  const dCount = decimalsCount(DOS_UNIT);
+
+  const i = u / DOS_UNIT;
+  const d = (u % DOS_UNIT).toString().padStart(dCount, "0");
+  return d.replace(/0+$/, "") ? `${i}.${d.replace(/0+$/, "")}` : i.toString();
+}
+
+// Fee paramétrable (aujourd’hui fixe, demain tu peux changer la règle)
+function computeTransferFeeUnits(/* amountUnits */) {
+  return TRANSFER_FEE_UNITS;
+}
+
 
 // ====== TIMING (UNE SEULE FOIS) ======
 let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10); // durée d’un round en secondes
@@ -753,6 +865,22 @@ app.post("/api/settle", async (req, res) => {
 (async () => {
   try {
     await initDb();
+    app.get("/api/dev/convert", (req, res) => {
+  const a = req.query.a ?? "1200.5";
+  try {
+    const units = parseDosToUnits(a);
+    return res.json({
+      input_dos: String(a),
+      units: units.toString(),
+      back_to_dos: formatUnitsToDos(units),
+      fee_units: computeTransferFeeUnits(units).toString(),
+      fee_dos: formatUnitsToDos(computeTransferFeeUnits(units)),
+    });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
     app.listen(PORT, () => {
       console.log(`✅ ddj-api listening on :${PORT}`);
     });
