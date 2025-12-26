@@ -19,7 +19,6 @@ function base64urlDecode(str) {
   while (str.length % 4) str += "=";
   return Buffer.from(str, "base64");
 }
-
 function hashPin(pin) {
   const salt = crypto.randomBytes(16);
   const derived = crypto.scryptSync(String(pin) + SECRET_SEED, salt, 32);
@@ -29,16 +28,19 @@ function hashPin(pin) {
 function verifyPin(pin, stored) {
   try {
     if (!stored) return false;
-    const [tag, saltB64, hashB64] = String(stored).split("$");
-    if (tag !== "scrypt" || !saltB64 || !hashB64) return false;
+    const [alg, saltB64, hashB64] = String(stored).split("$");
+    if (alg !== "scrypt" || !saltB64 || !hashB64) return false;
+
     const salt = Buffer.from(saltB64, "base64");
     const expected = Buffer.from(hashB64, "base64");
     const derived = crypto.scryptSync(String(pin) + SECRET_SEED, salt, expected.length);
+
     return crypto.timingSafeEqual(derived, expected);
   } catch {
     return false;
   }
 }
+
 
 function signPlayerToken(payload) {
   const p = base64urlEncode(JSON.stringify(payload));
@@ -83,199 +85,6 @@ const app = express();
 app.get("/health", (req, res) => res.json({ status: "ok", service: "ddj-api", ts: new Date().toISOString() }));
 app.get("/api/v1/health", (req, res) => res.json({ status: "ok", service: "ddj-api", ts: new Date().toISOString() }));
 app.use(express.json());
-
-// ====== CONFIG ======
-const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || "";
-const DATABASE_URL = process.env.DATABASE_URL || "";
-const SIGNUP_BONUS_DOS = parseInt(process.env.SIGNUP_BONUS_DOS || "50", 10);
-const DOS_UNIT = BigInt(process.env.DOS_UNIT || "10");               // 1 DOS = 10 unités
-const TRANSFER_FEE_UNITS = BigInt(process.env.TRANSFER_FEE_UNITS || "5"); // 0.5 DOS
-
-function isPowerOf10(n) {
-  let x = n;
-  while (x > 1n && x % 10n === 0n) x /= 10n;
-  return x === 1n;
-}
-
-function decimalsCount(scale) {
-  // scale doit être 10, 100, 1000...
-  if (!isPowerOf10(scale)) throw new Error("DOS_UNIT must be a power of 10 (10,100,1000...)");
-  return scale.toString().length - 1; // 10->1, 100->2, etc.
-}
-
-function parseDosToUnits(dosInput) {
-  const s = String(dosInput ?? "").trim();
-  if (!s) throw new Error("amount_dos required");
-  if (!/^\d+(\.\d+)?$/.test(s)) throw new Error("invalid DOS amount");
-
-  const dCount = decimalsCount(DOS_UNIT);
-  const [intPart, decRaw = ""] = s.split(".");
-  if (decRaw.length > dCount) throw new Error(`too many decimals (max ${dCount})`);
-
-  const decPart = (decRaw + "0".repeat(dCount)).slice(0, dCount); // pad à droite
-  return BigInt(intPart) * DOS_UNIT + BigInt(decPart || "0");
-}
-
-function formatUnitsToDos(unitsInput) {
-  const u = BigInt(unitsInput);
-  const dCount = decimalsCount(DOS_UNIT);
-
-  const i = u / DOS_UNIT;
-  const d = (u % DOS_UNIT).toString().padStart(dCount, "0");
-  return d.replace(/0+$/, "") ? `${i}.${d.replace(/0+$/, "")}` : i.toString();
-}
-
-// Fee paramétrable (aujourd’hui fixe, demain tu peux changer la règle)
-function computeTransferFeeUnits(/* amountUnits */) {
-  return TRANSFER_FEE_UNITS;
-}
-
-
-// ====== TIMING (UNE SEULE FOIS) ======
-let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10); // durée d’un round en secondes
-let closeBetsAt = parseInt(process.env.CLOSE_BETS_AT || "30", 10); // fermeture X secondes AVANT la fin
-let anchorMs = parseInt(process.env.ANCHOR_MS || String(Date.now()), 10);
-
-// ----- Timing guardrails (anti-bug) -----
-if (!Number.isFinite(roundSeconds) || roundSeconds < 30) roundSeconds = 300;
-if (!Number.isFinite(closeBetsAt) || closeBetsAt < 1) closeBetsAt = 30;
-if (closeBetsAt >= roundSeconds) closeBetsAt = Math.max(1, roundSeconds - 1);
-if (!Number.isFinite(anchorMs)) anchorMs = Date.now();
-
-// ----- Round engine (single source of truth) -----
-function getRoundInfo(nowMs = Date.now()) {
-  const roundMs = roundSeconds * 1000;
-
-  const roundId = Math.floor((nowMs - anchorMs) / roundMs);
-  const roundStartMs = anchorMs + roundId * roundMs;
-  const roundEndMs = roundStartMs + roundMs;
-
-  // fermeture des mises = X secondes AVANT la fin
-  const closeAtMs = roundEndMs - closeBetsAt * 1000;
-
-  const betsOpen = nowMs < closeAtMs;
-  const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
-  const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
-
-  return {
-    roundId,
-    roundStartMs,
-    roundEndMs,
-    closeAtMs,
-    betsOpen,
-    secondsLeft,
-    secondsToClose,
-  };
-}
-
-// pour /api/settle: recalculer roundStart/End depuis roundId
-function getRoundById(roundId) {
-  const roundMs = roundSeconds * 1000;
-  const roundStartMs = anchorMs + roundId * roundMs;
-  const roundEndMs = roundStartMs + roundMs;
-  const closeAtMs = roundEndMs - closeBetsAt * 1000;
-  return { roundId, roundStartMs, roundEndMs, closeAtMs };
-}
-
-// ====== DB (Pool local si besoin) ======
-if (!DATABASE_URL) console.error("❌ DATABASE_URL manquant (Render env var).");
-
-const pool2 = new Pool({
-  connectionString: DATABASE_URL,
-  ssl:
-    DATABASE_URL.includes("localhost") || DATABASE_URL.includes("127.0.0.1")
-      ? false
-      : { rejectUnauthorized: false },
-});
-
-// ====== Helpers ======
-function requireAdmin(req) {
-  const k = req.header("x-admin-key") || "";
-  if (!ADMIN_KEY || k !== ADMIN_KEY) return false;
-  return true;
-}
-
-function hashSeed(...parts) {
-  const h = crypto.createHash("sha256");
-  h.update(SECRET_SEED || "dev-seed");
-  for (const p of parts) h.update(String(p));
-  return h.digest("hex");
-}
-
-function pickOutcomeForRound(roundId) {
-  // RNG déterministe (même roundId => même outcome)
-  // outcome = 4 numéros (1..20) + chance (1..5)
-  const hex = hashSeed("round", roundId);
-  // on génère une suite pseudo-aléatoire à partir du hash
-  let idx = 0;
-  const nextInt = (mod) => {
-    const slice = hex.slice(idx, idx + 8);
-    idx = (idx + 8) % hex.length;
-    const n = parseInt(slice, 16);
-    return n % mod;
-  };
-
-  const nums = new Set();
-  while (nums.size < 4) nums.add(1 + nextInt(20));
-  const main = Array.from(nums).sort((a, b) => a - b);
-  const chance = 1 + nextInt(5);
-
-  return { main, chance };
-}
-
-function normalizeNums(nums) {
-  // unique + tri
-  const s = new Set(nums.map((n) => Number(n)));
-  const arr = Array.from(s).filter((n) => Number.isFinite(n));
-  arr.sort((a, b) => a - b);
-  return arr;
-}
-
-function choiceKey(nums, chance) {
-  // ex: "1-7-12-20#3"
-  return `${nums.join("-")}#${chance}`;
-}
-
-function countMatches(aNums, bNums) {
-  const setB = new Set(bNums);
-  let m = 0;
-  for (const n of aNums) if (setB.has(n)) m++;
-  return m;
-}
-
-function prizeCategory(matches, chanceOk) {
-  // Tes catégories (avec ton ajout 1 juste + 1 chance)
-  // Format "X+Y" (X matches, Y = 1 si chance ok)
-  const c = chanceOk ? 1 : 0;
-
-  if (matches >= 4 && c === 1) return "4+1";
-  if (matches >= 4 && c === 0) return "4+0";
-  if (matches === 3 && c === 1) return "3+1";
-  if (matches === 3 && c === 0) return "3+0";
-  if (matches === 2 && c === 1) return "2+1";
-  if (matches === 2 && c === 0) return "2+0";
-  if (matches === 1 && c === 1) return "1+1";
-  return null;
-}
-
-// ====== Config gains (tes règles) ======
-const WIN_POOL_PERCENT = 0.65; // 65% du total des mises du round
-const CARRY_PERCENT = 0.10; // 10% report au prochain round
-const ADMIN_PERCENT = 0.25; // 25% admin (solde admin)
-
-// Répartition interne du "win pool" par catégories
-// (tu peux ajuster, mais on garde une base cohérente)
-const POT_SHARES = {
-  "4+1": 0.35,
-  "4+0": 0.15,
-  "3+1": 0.18,
-  "3+0": 0.10,
-  "2+1": 0.10,
-  "2+0": 0.07,
-  "1+1": 0.05,
-};
-
 // ====== ROUTES ======
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, service: "ddj-api", api_version: "v1" });
@@ -349,6 +158,33 @@ app.post("/api/player/signup", async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
+app.post("/api/player/set-pin", async (req, res) => {
+  const { username, pin } = req.body || {};
+
+  if (!username) return res.status(400).json({ error: "username required" });
+  if (!pin) return res.status(400).json({ error: "pin required" });
+
+  const pinStr = String(pin).trim();
+  if (!/^\d{4}$/.test(pinStr)) {
+    return res.status(400).json({ error: "pin must be 4 digits" });
+  }
+
+  const r = await pool.query(
+    `SELECT id, username, pin_hash FROM players WHERE username = $1`,
+    [String(username)]
+  );
+  if (r.rowCount === 0) return res.status(404).json({ error: "player not found" });
+
+  const player = r.rows[0];
+  if (player.pin_hash) return res.status(400).json({ error: "pin already set" });
+
+  const pin_hash = hashPin(pinStr);
+
+  await pool.query(`UPDATE players SET pin_hash = $1 WHERE id = $2`, [pin_hash, player.id]);
+
+  return res.json({ ok: true, player: { id: String(player.id), username: player.username } });
+});
+
 
 // POST /api/player/redeem { playerId, code }
 app.post("/api/player/redeem", async (req, res) => {
@@ -380,6 +216,106 @@ app.post("/api/player/redeem", async (req, res) => {
         return res.status(409).json({ error: "code not active" });
       if (gc.expires_at && Date.now() > new Date(gc.expires_at).getTime())
         return res.status(409).json({ error: "code expired" });
+      app.post("/api/merchant/ticket/redeem", async (req, res) => {
+  const { merchantId, pin, ticket } = req.body || {};
+  if (!merchantId) return res.status(400).json({ error: "merchantId required" });
+  if (!pin) return res.status(400).json({ error: "pin required" });
+  if (!ticket) return res.status(400).json({ error: "ticket required" });
+
+  const codeHash = hashTicketCode(String(ticket));
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const mr = await client.query(
+      "SELECT id, pin_hash, type FROM players WHERE id=$1 FOR UPDATE",
+      [String(merchantId)]
+    );
+    if (mr.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "merchant not found" });
+    }
+    const merchant = mr.rows[0];
+    if (merchant.type !== "MERCHANT") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "not a MERCHANT" });
+    }
+    if (!merchant.pin_hash || !verifyPin(pin, merchant.pin_hash)) {
+      await client.query("ROLLBACK");
+      return res.status(401).json({ error: "bad pin" });
+    }
+
+    const tr = await client.query(
+      "SELECT * FROM transfer_tickets WHERE code_hash=$1 FOR UPDATE",
+      [codeHash]
+    );
+    if (tr.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "ticket not found" });
+    }
+    const t = tr.rows[0];
+
+    if (t.status !== "OPEN") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `ticket not OPEN (${t.status})` });
+    }
+    if (String(t.to_merchant_id) !== String(merchantId)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "ticket not for this merchant" });
+    }
+
+    const now = new Date();
+    if (new Date(t.expires_at).getTime() < now.getTime()) {
+      // ticket expiré => refund automatique
+      await client.query(
+        "UPDATE players SET balance_dos = balance_dos + $1 WHERE id=$2",
+        [String(t.amount_units), String(t.from_player_id)]
+      );
+      await client.query(
+        "UPDATE transfer_tickets SET status='EXPIRED' WHERE id=$1",
+        [String(t.id)]
+      );
+      await client.query("COMMIT");
+      return res.status(400).json({ error: "ticket expired (refunded)" });
+    }
+
+    // crédit merchant net
+    await client.query(
+      "UPDATE players SET balance_dos = balance_dos + $1 WHERE id=$2",
+      [String(t.net_units), String(merchantId)]
+    );
+
+    // crédit ADMIN fee
+    const ar = await client.query(
+      "SELECT id FROM players WHERE username=$1 FOR UPDATE",
+      [ADMIN_USERNAME]
+    );
+    if (ar.rowCount === 0) throw new Error("ADMIN player missing");
+    await client.query(
+      "UPDATE players SET balance_dos = balance_dos + $1 WHERE id=$2",
+      [String(t.fee_units), String(ar.rows[0].id)]
+    );
+
+    await client.query(
+      "UPDATE transfer_tickets SET status='REDEEMED', redeemed_at=now() WHERE id=$1",
+      [String(t.id)]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      ok: true,
+      merchant_received_dos: formatUnitsToDos(t.net_units),
+      fee_dos: formatUnitsToDos(t.fee_units),
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    return res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
 
       // credit player
       const p = await c.query(
@@ -880,6 +816,113 @@ app.post("/api/settle", async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 });
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "ADMIN";
+const TICKET_TTL_MINUTES = Number(process.env.TICKET_TTL_MINUTES || 180);
+
+app.post("/api/player/ticket/generate", async (req, res) => {
+  const { username, pin, merchantId, amountDos } = req.body || {};
+  if (!username) return res.status(400).json({ error: "username required" });
+  if (!pin) return res.status(400).json({ error: "pin required" });
+  if (!merchantId) return res.status(400).json({ error: "merchantId required" });
+  if (amountDos == null) return res.status(400).json({ error: "amountDos required" });
+
+  let amountUnits;
+  try {
+    amountUnits = parseDosToUnits(String(amountDos)); // ex "1200" ou "1200.5"
+  } catch (e) {
+    return res.status(400).json({ error: "invalid amountDos" });
+  }
+
+  const feeUnits = computeTransferFeeUnits(amountUnits); // 0.5 DOS => 5 units
+  const netUnits = amountUnits - feeUnits;
+  if (amountUnits <= 0) return res.status(400).json({ error: "amount must be > 0" });
+  if (netUnits <= 0) return res.status(400).json({ error: "amount too small (fee exceeds amount)" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // lock player row
+    const pr = await client.query(
+      "SELECT id, balance_dos, pin_hash FROM players WHERE username=$1 FOR UPDATE",
+      [String(username)]
+    );
+    if (pr.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "player not found" });
+    }
+    const player = pr.rows[0];
+    if (!player.pin_hash) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "pin not set" });
+    }
+    if (!verifyPin(pin, player.pin_hash)) {
+      await client.query("ROLLBACK");
+      return res.status(401).json({ error: "bad pin" });
+    }
+
+    // merchant must exist
+    const mr = await client.query(
+      "SELECT id, type FROM players WHERE id=$1",
+      [String(merchantId)]
+    );
+    if (mr.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "merchant not found" });
+    }
+    if (mr.rows[0].type !== "MERCHANT") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "target is not MERCHANT" });
+    }
+
+    // funds check (balance_dos = units)
+    const bal = BigInt(player.balance_dos);
+    if (bal < BigInt(amountUnits)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "insufficient balance" });
+    }
+
+    // debit player now (ticket is funded)
+    await client.query(
+      "UPDATE players SET balance_dos = balance_dos - $1 WHERE id=$2",
+      [String(amountUnits), String(player.id)]
+    );
+
+    const code = generateTicketCode(12);
+    const codeHash = hashTicketCode(code);
+    const expiresAt = new Date(Date.now() + TICKET_TTL_MINUTES * 60 * 1000);
+
+    await client.query(
+      `INSERT INTO transfer_tickets
+        (code_hash, from_player_id, to_merchant_id, amount_units, fee_units, net_units, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        codeHash,
+        String(player.id),
+        String(merchantId),
+        String(amountUnits),
+        String(feeUnits),
+        String(netUnits),
+        expiresAt.toISOString(),
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      ok: true,
+      ticket: code,
+      expires_at: expiresAt.toISOString(),
+      amount_dos: formatUnitsToDos(amountUnits),
+      fee_dos: formatUnitsToDos(feeUnits),
+      merchant_receives_dos: formatUnitsToDos(netUnits),
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    return res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    client.release();
+  }
+});
 
     app.listen(PORT, () => {
       console.log(`✅ ddj-api listening on :${PORT}`);
@@ -889,3 +932,196 @@ app.post("/api/settle", async (req, res) => {
     process.exit(1);
   }
 })();
+
+// ====== CONFIG ======
+const PORT = process.env.PORT || 3000;
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const SIGNUP_BONUS_DOS = parseInt(process.env.SIGNUP_BONUS_DOS || "50", 10);
+const DOS_UNIT = BigInt(process.env.DOS_UNIT || "10");               // 1 DOS = 10 unités
+const TRANSFER_FEE_UNITS = BigInt(process.env.TRANSFER_FEE_UNITS || "5"); // 0.5 DOS
+
+function isPowerOf10(n) {
+  let x = n;
+  while (x > 1n && x % 10n === 0n) x /= 10n;
+  return x === 1n;
+}
+
+function decimalsCount(scale) {
+  // scale doit être 10, 100, 1000...
+  if (!isPowerOf10(scale)) throw new Error("DOS_UNIT must be a power of 10 (10,100,1000...)");
+  return scale.toString().length - 1; // 10->1, 100->2, etc.
+}
+
+function parseDosToUnits(dosInput) {
+  const s = String(dosInput ?? "").trim();
+  if (!s) throw new Error("amount_dos required");
+  if (!/^\d+(\.\d+)?$/.test(s)) throw new Error("invalid DOS amount");
+
+  const dCount = decimalsCount(DOS_UNIT);
+  const [intPart, decRaw = ""] = s.split(".");
+  if (decRaw.length > dCount) throw new Error(`too many decimals (max ${dCount})`);
+
+  const decPart = (decRaw + "0".repeat(dCount)).slice(0, dCount); // pad à droite
+  return BigInt(intPart) * DOS_UNIT + BigInt(decPart || "0");
+}
+
+function formatUnitsToDos(unitsInput) {
+  const u = BigInt(unitsInput);
+  const dCount = decimalsCount(DOS_UNIT);
+
+  const i = u / DOS_UNIT;
+  const d = (u % DOS_UNIT).toString().padStart(dCount, "0");
+  return d.replace(/0+$/, "") ? `${i}.${d.replace(/0+$/, "")}` : i.toString();
+}
+
+// Fee paramétrable (aujourd’hui fixe, demain tu peux changer la règle)
+function computeTransferFeeUnits(/* amountUnits */) {
+  return TRANSFER_FEE_UNITS;
+}
+
+
+// ====== TIMING (UNE SEULE FOIS) ======
+let roundSeconds = parseInt(process.env.ROUND_SECONDS || "300", 10); // durée d’un round en secondes
+let closeBetsAt = parseInt(process.env.CLOSE_BETS_AT || "30", 10); // fermeture X secondes AVANT la fin
+let anchorMs = parseInt(process.env.ANCHOR_MS || String(Date.now()), 10);
+
+// ----- Timing guardrails (anti-bug) -----
+if (!Number.isFinite(roundSeconds) || roundSeconds < 30) roundSeconds = 300;
+if (!Number.isFinite(closeBetsAt) || closeBetsAt < 1) closeBetsAt = 30;
+if (closeBetsAt >= roundSeconds) closeBetsAt = Math.max(1, roundSeconds - 1);
+if (!Number.isFinite(anchorMs)) anchorMs = Date.now();
+
+// ----- Round engine (single source of truth) -----
+function getRoundInfo(nowMs = Date.now()) {
+  const roundMs = roundSeconds * 1000;
+
+  const roundId = Math.floor((nowMs - anchorMs) / roundMs);
+  const roundStartMs = anchorMs + roundId * roundMs;
+  const roundEndMs = roundStartMs + roundMs;
+
+  // fermeture des mises = X secondes AVANT la fin
+  const closeAtMs = roundEndMs - closeBetsAt * 1000;
+
+  const betsOpen = nowMs < closeAtMs;
+  const secondsLeft = Math.max(0, Math.ceil((roundEndMs - nowMs) / 1000));
+  const secondsToClose = Math.max(0, Math.ceil((closeAtMs - nowMs) / 1000));
+
+  return {
+    roundId,
+    roundStartMs,
+    roundEndMs,
+    closeAtMs,
+    betsOpen,
+    secondsLeft,
+    secondsToClose,
+  };
+}
+
+// pour /api/settle: recalculer roundStart/End depuis roundId
+function getRoundById(roundId) {
+  const roundMs = roundSeconds * 1000;
+  const roundStartMs = anchorMs + roundId * roundMs;
+  const roundEndMs = roundStartMs + roundMs;
+  const closeAtMs = roundEndMs - closeBetsAt * 1000;
+  return { roundId, roundStartMs, roundEndMs, closeAtMs };
+}
+
+// ====== DB (Pool local si besoin) ======
+if (!DATABASE_URL) console.error("❌ DATABASE_URL manquant (Render env var).");
+
+const pool2 = new Pool({
+  connectionString: DATABASE_URL,
+  ssl:
+    DATABASE_URL.includes("localhost") || DATABASE_URL.includes("127.0.0.1")
+      ? false
+      : { rejectUnauthorized: false },
+});
+
+// ====== Helpers ======
+function requireAdmin(req) {
+  const k = req.header("x-admin-key") || "";
+  if (!ADMIN_KEY || k !== ADMIN_KEY) return false;
+  return true;
+}
+
+function hashSeed(...parts) {
+  const h = crypto.createHash("sha256");
+  h.update(SECRET_SEED || "dev-seed");
+  for (const p of parts) h.update(String(p));
+  return h.digest("hex");
+}
+
+function pickOutcomeForRound(roundId) {
+  // RNG déterministe (même roundId => même outcome)
+  // outcome = 4 numéros (1..20) + chance (1..5)
+  const hex = hashSeed("round", roundId);
+  // on génère une suite pseudo-aléatoire à partir du hash
+  let idx = 0;
+  const nextInt = (mod) => {
+    const slice = hex.slice(idx, idx + 8);
+    idx = (idx + 8) % hex.length;
+    const n = parseInt(slice, 16);
+    return n % mod;
+  };
+
+  const nums = new Set();
+  while (nums.size < 4) nums.add(1 + nextInt(20));
+  const main = Array.from(nums).sort((a, b) => a - b);
+  const chance = 1 + nextInt(5);
+
+  return { main, chance };
+}
+
+function normalizeNums(nums) {
+  // unique + tri
+  const s = new Set(nums.map((n) => Number(n)));
+  const arr = Array.from(s).filter((n) => Number.isFinite(n));
+  arr.sort((a, b) => a - b);
+  return arr;
+}
+
+function choiceKey(nums, chance) {
+  // ex: "1-7-12-20#3"
+  return `${nums.join("-")}#${chance}`;
+}
+
+function countMatches(aNums, bNums) {
+  const setB = new Set(bNums);
+  let m = 0;
+  for (const n of aNums) if (setB.has(n)) m++;
+  return m;
+}
+
+function prizeCategory(matches, chanceOk) {
+  // Tes catégories (avec ton ajout 1 juste + 1 chance)
+  // Format "X+Y" (X matches, Y = 1 si chance ok)
+  const c = chanceOk ? 1 : 0;
+
+  if (matches >= 4 && c === 1) return "4+1";
+  if (matches >= 4 && c === 0) return "4+0";
+  if (matches === 3 && c === 1) return "3+1";
+  if (matches === 3 && c === 0) return "3+0";
+  if (matches === 2 && c === 1) return "2+1";
+  if (matches === 2 && c === 0) return "2+0";
+  if (matches === 1 && c === 1) return "1+1";
+  return null;
+}
+
+// ====== Config gains (tes règles) ======
+const WIN_POOL_PERCENT = 0.65; // 65% du total des mises du round
+const CARRY_PERCENT = 0.10; // 10% report au prochain round
+const ADMIN_PERCENT = 0.25; // 25% admin (solde admin)
+
+// Répartition interne du "win pool" par catégories
+// (tu peux ajuster, mais on garde une base cohérente)
+const POT_SHARES = {
+  "4+1": 0.35,
+  "4+0": 0.15,
+  "3+1": 0.18,
+  "3+0": 0.10,
+  "2+1": 0.10,
+  "2+0": 0.07,
+  "1+1": 0.05,
+};
+
